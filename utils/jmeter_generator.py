@@ -110,8 +110,7 @@ class JMeterScriptGenerator:
             "testname": "Users",
             "enabled": "true"
         })
-        self_controller = self._create_element(thread_group, "stringProp", {"name": "ThreadGroup.on_sample_error"})
-        self_controller.text = "continue"
+        self._create_string_prop(thread_group, "ThreadGroup.on_sample_error", "continue")  # Direct string prop
 
         self._create_string_prop(thread_group, "ThreadGroup.num_threads", str(num_users))
         self._create_string_prop(thread_group, "ThreadGroup.ramp_time", str(ramp_up_time))
@@ -148,15 +147,17 @@ class JMeterScriptGenerator:
         return thread_group_hash_tree
 
     def add_http_sampler(self, parent_element, name, method, path, parameters=None, body=None,
-                         headers=None):  # Added headers parameter
+                         headers=None) -> ET.Element:  # Added return type hint for sampler_hash_tree
         sampler = self._create_element(parent_element, "HTTPSamplerProxy", {
             "guiclass": "HttpTestSampleGui",
             "testclass": "HTTPSamplerProxy",
             "testname": name,
             "enabled": "true"
         })
+        # This is the hashTree that contains children elements scoped to this sampler
         sampler_hash_tree = self._create_element(sampler, "hashTree")
 
+        # Sampler properties (direct children of sampler)
         self._create_string_prop(sampler, "HTTPSampler.method", method)
         self._create_string_prop(sampler, "HTTPSampler.path", path)
         self._create_bool_prop(sampler, "HTTPSampler.auto_redirects", False)
@@ -167,7 +168,7 @@ class JMeterScriptGenerator:
         self._create_string_prop(sampler, "HTTPSampler.response_timeout", "")
 
         # Arguments for parameters (URL parameters or form data)
-        arguments = self._create_element(sampler, "elementProp", {
+        arguments = self._create_element(sampler, "elementProp", {  # Child of sampler
             "name": "HTTPsampler.Arguments",
             "elementType": "Arguments",
             "guiclass": "HTTPArgumentsPanel",
@@ -176,7 +177,6 @@ class JMeterScriptGenerator:
             "enabled": "true"
         })
         collection_prop = self._create_collection_prop(arguments, "Arguments.arguments")
-
         if parameters:
             for param_name, param_value in parameters.items():
                 arg_prop = self._create_element(collection_prop, "elementProp", {
@@ -190,11 +190,12 @@ class JMeterScriptGenerator:
 
         # For POST/PUT requests with JSON bodies
         if method in ["POST", "PUT", "PATCH"] and body:
-            post_data = self._create_element(sampler, "boolProp", {"name": "HTTPSampler.postBodyRaw"})
+            post_data = self._create_element(sampler, "boolProp",
+                                             {"name": "HTTPSampler.postBodyRaw"})  # Child of sampler
             post_data.text = "true"
 
-            body_data = self._create_element(sampler, "elementProp", {
-                "name": "HTTPsampler.Arguments",
+            body_data = self._create_element(sampler, "elementProp", {  # Child of sampler
+                "name": "HTTPsampler.Arguments",  # This name is also used for raw body data
                 "elementType": "Arguments",
                 "guiclass": "HTTPArgumentsPanel",
                 "testclass": "Arguments",
@@ -212,12 +213,13 @@ class JMeterScriptGenerator:
 
         # Add Header Manager if headers are provided
         if headers:
-            header_manager = self._create_element(sampler_hash_tree, "HeaderManager", {
-                "guiclass": "HeaderPanel",
-                "testclass": "HeaderManager",
-                "testname": "HTTP Header Manager",
-                "enabled": "true"
-            })
+            header_manager = self._create_element(sampler_hash_tree, "HeaderManager",
+                                                  {  # HeaderManager is a child of sampler_hash_tree
+                                                      "guiclass": "HeaderPanel",
+                                                      "testclass": "HeaderManager",
+                                                      "testname": "HTTP Header Manager",
+                                                      "enabled": "true"
+                                                  })
             header_collection_prop = self._create_collection_prop(header_manager, "HeaderManager.headers")
             for header_name, header_value in headers.items():
                 header_element = self._create_element(header_collection_prop, "elementProp", {
@@ -226,7 +228,12 @@ class JMeterScriptGenerator:
                 })
                 self._create_string_prop(header_element, "Header.name", header_name)
                 self._create_string_prop(header_element, "Header.value", header_value)
-            self._create_element(header_manager, "hashTree")  # Empty hash tree for HeaderManager
+            # FIX: REMOVED THE INCORRECT HASH TREE: self._create_element(header_manager, "hashTree")
+            # The HeaderManager does *not* have an internal hashTree.
+            # Its hashTree for scoping children (e.g., Assertions scoped to HeaderManager) is its own hashTree
+            # which is *not* what the ClassCastException was about. The error was due to the extra hashTree inside HeaderManager.
+
+        return sampler_hash_tree  # Return the hash_tree so other elements can be added to it
 
     def add_csv_data_config(self, parent_element, filename, variable_names, delimiter=",", quoted_data=False):
         csv_config_element = self._create_element(parent_element, "CSVDataSet", {
@@ -308,35 +315,28 @@ class JMeterScriptGenerator:
         for request_data in scenario_plan['requests']:
             endpoint_key = request_data['endpoint_key']
             parameters_from_llm = request_data.get('parameters', {})
-            # FIX: Ensure parameters_from_llm is a dictionary.
-            # If it was parsed from 'null', it will be None. Convert to empty dict.
             if parameters_from_llm is None:
                 parameters_from_llm = {}
                 logger.debug(f"Parameters for {endpoint_key} were None, defaulting to empty dict.")
 
-            # Check if LLM outputted parameters as a string and parse them
             if isinstance(parameters_from_llm, str):
                 try:
                     parameters_from_llm = json.loads(parameters_from_llm)
-                    if parameters_from_llm is None:  # If string was 'null'
+                    if parameters_from_llm is None:
                         parameters_from_llm = {}
                     logger.debug(f"Parsed parameters string for {endpoint_key}: {parameters_from_llm}")
                 except json.JSONDecodeError:
                     logger.error(
                         f"LLM generated invalid JSON string for parameters: {parameters_from_llm}. Skipping parameters for this request.")
-                    parameters_from_llm = {}  # Fallback to empty dict
+                    parameters_from_llm = {}
 
             # Loop through parameters to check for mapped data
             for param_name, param_value in parameters_from_llm.items():
                 if param_value.startswith("${") and param_value.endswith("}"):
                     # This is a JMeter variable, likely from a mapping
-                    # Extract the actual mapping (e.g., categories_id from ${categories_id})
                     jmeter_var_name = param_value[2:-1]  # Remove ${ and }
-                    # JMeter variable names might use underscores instead of dots from mappings
                     original_mapping_format = jmeter_var_name.replace('_', '.')
 
-                    # Find the actual mapping in our stored mappings
-                    # This is a bit indirect, but we need to find the table.column
                     found_mapping = None
                     for ep_key, ep_mappings in mappings.items():
                         for map_param, map_target in ep_mappings.items():
@@ -360,10 +360,8 @@ class JMeterScriptGenerator:
             for col_identifier in csv_columns:
                 table_name, column_name = col_identifier.split('.')
                 try:
-                    # Fetch all data for the relevant column
                     df = database_connector.preview_data(table_name, limit=None)  # Fetch all data
                     if not df.empty and column_name in df.columns:
-                        # Use list to store values, as iterrows can be inefficient for large datasets
                         column_values = df[column_name].tolist()
                         csv_data[col_identifier] = column_values
                         logger.debug(f"Collected {len(column_values)} values for {col_identifier}")
@@ -374,16 +372,13 @@ class JMeterScriptGenerator:
                     logger.error(f"Error fetching data for CSV for {col_identifier}: {e}")
 
             if csv_data:
-                # Determine max rows
                 max_rows = 0
                 if csv_data:
                     max_rows = max(len(v) for v in csv_data.values()) if csv_data else 0
 
-                # Create CSV content
                 csv_header = []
                 csv_rows = []
 
-                # Sort columns for consistent CSV output
                 sorted_csv_columns = sorted(list(csv_data.keys()))
                 csv_header = [col.replace('.', '_') for col in
                               sorted_csv_columns]  # JMeter variable names use underscores
@@ -398,7 +393,6 @@ class JMeterScriptGenerator:
                 csv_content = ",".join(csv_header) + "\n" + "\n".join(csv_rows)
                 logger.info(f"Generated CSV content with {max_rows} rows for columns: {csv_header}")
 
-                # Add CSV Data Set Config to the Thread Group
                 csv_variable_names = ",".join(csv_header)  # Use JMeter variable names (underscores)
                 self.add_csv_data_config(thread_group_elements, "data.csv", csv_variable_names)
             else:
@@ -410,48 +404,42 @@ class JMeterScriptGenerator:
             path = request_data['path']
             name = request_data['name']
             body = request_data.get('body')
-            # Extract headers from request_data, default to empty dict
             headers = request_data.get('headers', {})
 
             parameters_from_llm = request_data.get('parameters', {})
-            # FIX: Ensure parameters_from_llm is a dictionary.
-            # If it was parsed from 'null', it will be None. Convert to empty dict.
             if parameters_from_llm is None:
                 parameters_from_llm = {}
                 logger.debug(f"Parameters for {endpoint_key} were None, defaulting to empty dict.")
 
-            # If it's a string (from LLM output), attempt to parse it again here if not already parsed
             if isinstance(parameters_from_llm, str):
                 try:
                     parameters_from_llm = json.loads(parameters_from_llm)
-                    if parameters_from_llm is None:  # If string was 'null'
+                    if parameters_from_llm is None:
                         parameters_from_llm = {}
                     logger.debug(f"Parsed parameters string for {endpoint_key}: {parameters_from_llm}")
                 except json.JSONDecodeError:
                     logger.error(
-                        f"Failed to re-parse parameters string during sampler creation for {endpoint_key}. Using empty dict.")
+                        f"LLM generated invalid JSON string for parameters: {parameters_from_llm}. Skipping parameters for this request.")
                     parameters_from_llm = {}
 
-            # Replace mapped parameters with JMeter variable format using underscores
             processed_parameters = {}
             for param_name, param_value in parameters_from_llm.items():
                 if param_value.startswith("${") and param_value.endswith("}"):
-                    # This is already a JMeter variable from LLM, ensure underscore format
                     processed_parameters[param_name] = param_value.replace('.', '_')
                 else:
                     processed_parameters[param_name] = param_value
 
-            # Add HTTP Sampler, passing the extracted headers
-            self.add_http_sampler(thread_group_elements, name, method, path, processed_parameters, body, headers)
+            # Call add_http_sampler and get its internal hashTree
+            current_sampler_hash_tree = self.add_http_sampler(thread_group_elements, name, method, path,
+                                                              processed_parameters, body, headers)
 
-            # Add simple response assertion (e.g., check for 200 OK)
-            self.add_response_assertion(thread_group_elements, f"{name} - Status 200", "Response Code", "Equals", "200")
+            # Now, add assertions and extractors as children of current_sampler_hash_tree
+            self.add_response_assertion(current_sampler_hash_tree, f"{name} - Status 200", "Response Code", "Equals",
+                                        "200")
 
-            # Example: Add JSON Extractor if the response might contain an ID for chaining
-            # This is a heuristic and would need more sophisticated LLM guidance for real-world scenarios
-            if method == "POST" and body and isinstance(body, str) and "id" in body:  # more robust check
+            if method == "POST" and body and isinstance(body, str) and "id" in body:
                 logger.debug(f"Adding JSON Extractor for {name} to capture 'id'.")
-                self.add_json_extractor(thread_group_elements, f"{name} - Extract ID", "$.id",
+                self.add_json_extractor(current_sampler_hash_tree, f"{name} - Extract ID", "$.id",
                                         f"{name.replace(' ', '_')}_id")
 
         # Generate XML string
@@ -469,8 +457,9 @@ class JMeterScriptGenerator:
 
     # Placeholder for JMX content generation (replace with actual JMeter XML generation)
     def _generate_placeholder_jmx(self, endpoints, mappings, thread_group_users, ramp_up_time, loop_count) -> str:
+        # This placeholder logic is not currently used by generate_jmx, but kept for completeness
         jmx_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.5">
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.2.1">
   <hashTree>
     <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Generated Test Plan" enabled="true">
       <stringProp name="TestPlan.comments"></stringProp>
@@ -521,32 +510,7 @@ class JMeterScriptGenerator:
             jmx_content += f"""
         <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="{endpoint.method} {endpoint.path}" enabled="true">
           <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
-            <collectionProp name="Arguments.arguments">
-"""
-            # Add parameters from mappings or just placeholders
-            endpoint_key = f"{endpoint.method} {endpoint.path}"
-            if endpoint_key in mappings:
-                for param, mapped_col in mappings[endpoint_key].items():
-                    jmx_content += f"""
-              <elementProp name="{param}" elementType="HTTPArgument">
-                <boolProp name="HTTPArgument.always_encode">false</boolProp>
-                <stringProp name="Argument.value">${{{mapped_col.replace('.', '_')}}}</stringProp>
-                <stringProp name="Argument.metadata">=</stringProp>
-                <stringProp name="Argument.name">{param}</stringProp>
-              </elementProp>
-"""
-            else:
-                for param in endpoint.parameters:
-                    jmx_content += f"""
-              <elementProp name="{param['name']}" elementType="HTTPArgument">
-                <boolProp name="HTTPArgument.always_encode">false</boolProp>
-                <stringProp name="Argument.value">dummy_value</stringProp>
-                <stringProp name="Argument.metadata">=</stringProp>
-                <stringProp name="Argument.name">{param['name']}</stringProp>
-              </elementProp>
-"""
-            jmx_content += f"""
-            </collectionProp>
+            <collectionProp name="Arguments.arguments"/>
           </elementProp>
           <stringProp name="HTTPSampler.method">{endpoint.method}</stringProp>
           <stringProp name="HTTPSampler.path">{endpoint.path}</stringProp>
