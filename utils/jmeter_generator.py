@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 
 class JMeterScriptGenerator:
     def __init__(self):
-        self.test_plan_root = ET.Element("jmeterTestPlan", version="1.2", properties="2.9", jmeter="5.5")
+        # Align jmeter version with the user's working JMX for better compatibility
+        self.test_plan_root = ET.Element("jmeterTestPlan", version="1.2", properties="5.0", jmeter="5.2.1")
         hash_tree = ET.SubElement(self.test_plan_root, "hashTree")
 
         self.test_plan = self._create_element(hash_tree, "TestPlan", attrib={
@@ -28,6 +29,8 @@ class JMeterScriptGenerator:
         self.elements = test_plan_hash_tree  # This will be the main container for thread groups and other elements
 
         # Default HTTP Request Defaults
+        # Call add_http_request_defaults here, which will add the ConfigTestElement
+        # and its sibling hashTree to self.elements
         self.add_http_request_defaults(self.elements)
 
         # CSV Data Set Config placeholder, added if needed later
@@ -60,12 +63,11 @@ class JMeterScriptGenerator:
             "enabled": "true"
         })
 
-        # Correct structure: ConfigTestElement has ONE immediate hashTree child
-        config_hash_tree = self._create_element(config, "hashTree")
+        # All properties and elementProps should be direct children of the ConfigTestElement itself
+        # This matches the structure seen in the user's working JMX file.
 
-        # All properties and elementProps should be children of this hashTree
         # 1. Arguments Element (elementProp)
-        arguments_prop = self._create_element(config_hash_tree, "elementProp", {  # Corrected parent to config_hash_tree
+        arguments_prop = self._create_element(config, "elementProp", {
             "name": "HTTPsampler.Arguments",
             "elementType": "Arguments",
             "guiclass": "HTTPArgumentsPanel",
@@ -73,22 +75,33 @@ class JMeterScriptGenerator:
             "testname": "User Defined Variables",
             "enabled": "true"
         })
-        self._create_collection_prop(arguments_prop, "Arguments.arguments")  # Empty collection for defaults
+        self._create_collection_prop(arguments_prop, "Arguments.arguments")  # Empty collection for arguments
 
-        # 2. String Properties
-        self._create_string_prop(config_hash_tree, "HTTPSampler.protocol", protocol)  # Corrected parent
-        self._create_string_prop(config_hash_tree, "HTTPSampler.domain", domain)  # Corrected parent
-        self._create_string_prop(config_hash_tree, "HTTPSampler.port", str(port))  # Corrected parent
-        self._create_string_prop(config_hash_tree, "HTTPSampler.connect_timeout", "")  # Corrected parent
-        self._create_string_prop(config_hash_tree, "HTTPSampler.response_timeout", "")  # Corrected parent
+        # 2. String Properties (direct children of config)
+        self._create_string_prop(config, "HTTPSampler.protocol", protocol)
+        self._create_string_prop(config, "HTTPSampler.domain", domain)
+        self._create_string_prop(config, "HTTPSampler.port", str(port))
+        self._create_string_prop(config, "HTTPSampler.contentEncoding", "")  # Added as per working JMX
+        self._create_string_prop(config, "HTTPSampler.proxyHost", "")  # Added as per working JMX
+        self._create_string_prop(config, "HTTPSampler.proxyPort", "")  # Added as per working JMX
+        self._create_string_prop(config, "HTTPSampler.proxyUser", "")  # Added as per working JMX
+        self._create_string_prop(config, "HTTPSampler.proxyPass", "")  # Added as per working JMX
+        self._create_string_prop(config, "HTTPSampler.connect_timeout", "")
+        self._create_string_prop(config, "HTTPSampler.response_timeout", "")
 
-        # 3. Boolean Properties
-        self._create_bool_prop(config_hash_tree, "HTTPSampler.follow_redirects", True)  # Corrected parent
-        self._create_bool_prop(config_hash_tree, "HTTPSampler.auto_redirects", False)  # Corrected parent
-        self._create_bool_prop(config_hash_tree, "HTTPSampler.use_keepalive", True)  # Corrected parent
-        self._create_bool_prop(config_hash_tree, "HTTPSampler.DO_MULTIPART_POST", False)  # Corrected parent
-        self._create_bool_prop(config_hash_tree, "HTTPSampler.BROWSER_COMPATIBLE_MULTIPART", True)  # Corrected parent
-        self._create_bool_prop(config_hash_tree, "HTTPSampler.concurrentDwn", False)  # Corrected parent
+        # 3. Boolean Properties (direct children of config)
+        # Order within string/bool props is less critical but following working JMX
+        self._create_bool_prop(config, "HTTPSampler.send_chunked_post_body", False)  # Corrected to boolProp
+        self._create_bool_prop(config, "HTTPSampler.follow_redirects", True)
+        self._create_bool_prop(config, "HTTPSampler.auto_redirects", False)
+        self._create_bool_prop(config, "HTTPSampler.use_keepalive", True)
+        self._create_bool_prop(config, "HTTPSampler.DO_MULTIPART_POST", False)
+        self._create_bool_prop(config, "HTTPSampler.BROWSER_COMPATIBLE_MULTIPART", True)
+        self._create_bool_prop(config, "HTTPSampler.concurrentDwn", False)  # Common JMeter default (if needed)
+
+        # Crucial: An empty hashTree as a SIBLING to ConfigTestElement, not a child
+        # This hashTree marks the end of the ConfigTestElement's scope/children
+        self._create_element(parent, "hashTree")
 
     def add_thread_group(self, num_users, ramp_up_time, loop_count, parent_element):
         thread_group = self._create_element(parent_element, "ThreadGroup", {
@@ -496,7 +509,7 @@ class JMeterScriptGenerator:
           <stringProp name="HTTPSampler.proxyPort"></stringProp>
           <stringProp name="HTTPSampler.proxyUser"></stringProp>
           <stringProp name="HTTPSampler.proxyPass"></stringProp>
-          <stringProp name="HTTPSampler.send_chunked_post_body">false</stringProp>
+          <boolProp name="HTTPSampler.send_chunked_post_body">false</boolProp>
           <stringProp name="HTTPSampler.connection_timeout"></stringProp>
           <stringProp name="HTTPSampler.response_timeout"></stringProp>
         </ConfigTestElement>
