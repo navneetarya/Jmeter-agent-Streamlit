@@ -3,12 +3,13 @@ import requests
 import json
 import sqlite3
 import pandas as pd
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import sys
 import re  # Import regex module
+from urllib.parse import urlparse  # Import urlparse for parsing base URL
 
 # FIX: Increase the string conversion limit for large integers.
 sys.set_int_max_str_digits(0)  # 0 means unlimited
@@ -16,13 +17,11 @@ sys.set_int_max_str_digits(0)  # 0 means unlimited
 # Add utils to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
 
-from swagger_parser import SwaggerParser, SwaggerEndpoint
-from database_connector import DatabaseConnector, DatabaseConfig
-from data_mapper import DataMapper
-from jmeter_generator import JMeterScriptGenerator  # Re-enabled the JMeterScriptGenerator import
+# Assuming these are available and correct from the 'utils' directory
+from utils.jmeter_generator import JMeterScriptGenerator
 
 # Configure logging to DEBUG level for detailed output
-logging.basicConfig(level=logging.DEBUG)  # Changed to DEBUG
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +42,10 @@ class SwaggerEndpoint:
     method: str
     parameters: List[Dict[str, Any]]
     responses: Dict[str, Any]
+    summary: Optional[str] = None
+    operation_id: Optional[str] = None
+    produces: List[str] = field(default_factory=list)
+    request_body: Optional[Dict[str, Any]] = None
 
 
 class SwaggerParser:
@@ -51,6 +54,7 @@ class SwaggerParser:
     def __init__(self, swagger_url: str):
         self.swagger_url = swagger_url
         self.swagger_spec = None
+        self.swagger_data = {}
 
     def fetch_swagger_spec(self) -> Dict[str, Any]:
         """Fetch and parse Swagger specification"""
@@ -58,6 +62,7 @@ class SwaggerParser:
             response = requests.get(self.swagger_url, timeout=10)
             response.raise_for_status()
             self.swagger_spec = response.json()
+            self.swagger_data = self.swagger_spec  # Store fetched data
             return self.swagger_spec
         except Exception as e:
             logger.error(f"Failed to fetch Swagger spec: {e}")
@@ -76,12 +81,25 @@ class SwaggerParser:
                 if method.upper() in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']:
                     parameters = method_data.get('parameters', [])
                     responses = method_data.get('responses', {})
+                    summary = method_data.get('summary')
+                    operation_id = method_data.get('operationId')
+                    produces = method_data.get('produces', [])
+
+                    request_body_schema = None
+                    for param in parameters:
+                        if param.get('in') == 'body' and 'schema' in param:
+                            request_body_schema = param['schema']
+                            break  # Assume only one body parameter
 
                     endpoints.append(SwaggerEndpoint(
                         path=path,
                         method=method.upper(),
                         parameters=parameters,
-                        responses=responses
+                        responses=responses,
+                        summary=summary,
+                        operation_id=operation_id,
+                        produces=produces,
+                        request_body=request_body_schema
                     ))
 
         return endpoints
@@ -202,25 +220,15 @@ def _clean_url_string(url_string: str) -> str:
     """
     logger.debug(f"Entering _clean_url_string with: {repr(url_string)}")
 
-    # Step 1: Look for http(s):// at the beginning of the string or inside markdown link parentheses.
-    # This regex tries to capture the URL part from various malformed inputs, prioritizing the part inside markdown.
-    # (?:\[.*?\]\()?: Non-capturing group for optional markdown text part like [text](
-    # (https?:\/\/[^\s\]\)]+): Captures the actual URL (http/https followed by non-whitespace, non-bracket characters).
-    # (?:\))?: Non-capturing group for optional closing parenthesis for markdown links.
     match = re.search(r'(?:\[.*?\]\()?(https?:\/\/[^\s\]\)]+)(?:\))?', url_string)
     if match:
         cleaned_url = match.group(1).strip()
         logger.debug(f"Regex match found, extracted: {repr(cleaned_url)}")
         return cleaned_url
 
-    # Fallback 1: If no strong URL pattern (like the regex above) is found,
-    # try to remove common markdown/bracket characters directly.
     temp_url = url_string.replace('[', '').replace(']', '').replace('(', '').replace(')', '').strip()
     logger.debug(f"After basic bracket removal: {repr(temp_url)}")
 
-    # Fallback 2: If after basic removal, it still contains "https://" or "http://",
-    # take everything from that point onwards as the URL. This handles cases where
-    # the URL might be prefixed by other junk.
     if "https://" in temp_url:
         start_index = temp_url.find("https://")
         cleaned_url = temp_url[start_index:].strip()
@@ -232,7 +240,6 @@ def _clean_url_string(url_string: str) -> str:
         logger.debug(f"Found 'http://' after basic strip, result: {repr(cleaned_url)}")
         return cleaned_url
 
-    # Final fallback: Return the string after just stripping whitespace and initial markdown attempt.
     logger.debug(f"No clear URL pattern. Returning raw strip: {repr(temp_url)}")
     return temp_url
 
@@ -243,19 +250,16 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
                                thread_group_users: int,
                                ramp_up_time: int,
                                loop_count: int,
-                               api_key: str) -> Dict[str, Any]:  # api_key now passed as argument
+                               api_key: str) -> Dict[str, Any]:
     """
-    Calls an LLM to generate a structured scenario plan for JMeter.
-    The LLM will parse the prompt, swagger, and DB schema to decide the test flow.
+    Calls an LLM to generate a high-level test plan suggestion.
     """
 
-    # Prepare context for the LLM
     swagger_summary = []
     for ep in swagger_endpoints:
         params_summary = ", ".join([p.get('name', '') for p in ep.parameters])
-        # Include a placeholder for headers in the summary to guide LLM
         headers_summary = " (No specific headers)"
-        if ep.method == "POST" or ep.method == "PUT":  # Common methods for Content-Type
+        if ep.method == "POST" or ep.method == "PUT":
             headers_summary = " (Common headers: Content-Type: application/json)"
         swagger_summary.append(f"{ep.method} {ep.path} (Parameters: {params_summary}){headers_summary}")
 
@@ -263,14 +267,13 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
     for table_name, columns in db_tables_schema.items():
         db_schema_summary[table_name] = [col['name'] for col in columns]
 
-    # Sanitize the user's prompt by escaping it for JSON inclusion
     sanitized_prompt = json.dumps(prompt)
 
-    # Construct the prompt for the LLM
     llm_prompt = f"""
     You are an expert in performance testing and JMeter script generation.
-    Your task is to create a JMeter test plan scenario based on the user's request,
-    Swagger API endpoints, and a database schema.
+    Your task is to propose a high-level test plan based on the user's request,
+    Swagger API endpoints, and a database schema. This proposal will be used
+    to guide the user in setting up their test scenario in a UI.
 
     User's test scenario request: {sanitized_prompt}
 
@@ -283,280 +286,61 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
     Existing Data Mappings (parameter -> database.column):
     {json.dumps(existing_mappings, indent=2)}
 
-    Thread Group Configuration:
+    Thread Group Configuration (proposed):
     - Number of Users: {thread_group_users}
     - Ramp-up Time (seconds): {ramp_up_time}
     - Loop Count: {loop_count}
 
-    Based on the user's request, determine which API endpoints should be hit, in what order,
-    what parameters to use (prioritizing mapped parameters from the database, or generating
-    dummy/random data if no mapping exists and it's a POST/PUT), and if any chaining
-    (e.g., extracting an ID from one response to use in a subsequent request) is needed.
-    For POST/PUT requests, include appropriate 'Content-Type' headers as a JSON string.
+    Based on the user's request, provide a concise, high-level summary of
+    a suggested test flow. Do not generate the full detailed JSON scenario plan.
+    Instead, focus on suggesting:
+    1.  Which key API endpoints should be included.
+    2.  A logical sequence for these endpoints.
+    3.  Any crucial parameters that might need mapping or dynamic generation.
+    4.  General advice on assertions or correlation needed.
 
-    VERY IMPORTANT: Your response MUST be a single, valid JSON object that strictly adheres to the following schema.
-    DO NOT include any introductory text, conversational filler, markdown formatting (like triple backticks, e.g., ```json), or any other extraneous characters before or after the JSON object.
-    The output should start directly with '{{' and end directly with '}}'.
-
-    {{
-        "test_name": "A descriptive name for the test",
-        "thread_group": {{
-            "num_users": int,
-            "ramp_up": int,
-            "loop_count": int
-        }},
-        "requests": [
-            {{
-                "endpoint_key": "METHOD /path",
-                "name": "Human-readable sampler name",
-                "method": "GET|POST|PUT|DELETE|PATCH",
-                "path": "/actual/path",
-                "parameters": "JSON string of parameters, e.g., '{{\\"param1\\": \\"value1\\", \\"param2\\": \\"${{mapped_variable_name}}\\"}}'",
-                "body": "Raw body for POST/PUT (JSON/XML string), or null",
-                "use_mapping": true/false,
-                "headers": "JSON string of HTTP headers, e.g., '{{\\"Content-Type\\": \\"application/json\\", \\"Authorization\\": \\"Bearer xyz\\"}}'"
-            }}
-        ]
-    }}
-
-    If the user's prompt implies a sequence, reflect that in the order of requests.
-    If no specific flow is mentioned, generate a default scenario that includes common operations
-    like fetching data (GET) and potentially creating/updating data (POST/PUT) based on mappings.
-    For path parameters (e.g., in /pet/{{petId}}), ensure the path reflects the JMeter variable
-    if mapped (e.g., /pet/${{pets_id}}).
-    For dynamic data (like IDs for new creations), use JMeter functions where appropriate (e.g., ${{__Random(1,1000,)}}).
+    Respond in markdown format. Start with "Suggested Test Flow:"
     """
 
-    # Building URL from fragments to ensure no markdown is embedded in the literal.
-    # This is an extreme measure to bypass external parsing issues.
     protocol_segment = "https://"
     domain_segment = "generativelanguage.googleapis.com"
     path_segment = "/v1beta/models/gemini-2.0-flash:generateContent?key="
 
-    logger.debug(f"Protocol part (literal): {repr(protocol_segment)}")
-    logger.debug(f"Domain part (literal): {repr(domain_segment)}")
-    logger.debug(f"Path part (literal): {repr(path_segment)}")
-
-    # Joining fragments
     temp_base_api_url = "".join([protocol_segment, domain_segment, path_segment])
-    logger.debug(f"Combined base_api_url before explicit cleaning: {repr(temp_base_api_url)}")
-
-    # Explicitly clean the base URL after combination
     base_api_url_cleaned = _clean_url_string(temp_base_api_url)
-    logger.debug(f"Combined base_api_url after explicit cleaning: {repr(base_api_url_cleaned)}")
-
-    # Final API URL to be used in the request
     api_url = base_api_url_cleaned + api_key
-    logger.debug(f"Final api_url before request: {repr(api_url)}")
-    logger.info(f"Attempting to call LLM API at URL: {api_url}")
-    logger.info(f"Type of api_url: {type(api_url)}")
-    logger.info(f"Raw repr of api_url: {repr(api_url)}")  # This is the ultimate check
 
-    # Construct the payload for the LLM API
     payload = {
         "contents": [{"role": "user", "parts": [{"text": llm_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "test_name": {"type": "STRING"},
-                    "thread_group": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "num_users": {"type": "INTEGER"},
-                            "ramp_up": {"type": "INTEGER"},
-                            "loop_count": {"type": "INTEGER"}
-                        }
-                    },
-                    "requests": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "endpoint_key": {"type": "STRING"},
-                                "name": {"type": "STRING"},
-                                "method": {"type": "STRING"},
-                                "path": {"type": "STRING"},
-                                # Parameters are now a STRING type in the schema
-                                "parameters": {"type": "STRING"},
-                                "body": {"type": "STRING", "nullable": True},
-                                "use_mapping": {"type": "BOOLEAN"},
-                                # FIX: Add headers as a STRING type in the schema
-                                "headers": {"type": "STRING"}
-                            },
-                            "required": ["endpoint_key", "name", "method", "path", "parameters", "use_mapping",
-                                         "headers"]
-                        }
-                    }
-                },
-                "required": ["test_name", "thread_group", "requests"]
-            }
-        }
     }
 
-    # Log the full JSON payload before sending
-    logger.debug(f"Full JSON payload being sent to LLM API: {json.dumps(payload, indent=2)}")
-
-    scenario_plan = None
     try:
         response = requests.post(api_url, headers={'Content-Type': 'application/json'}, json=payload)
-        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
         result = response.json()
 
         if result.get('candidates') and len(result['candidates']) > 0 and \
                 result['candidates'][0].get('content') and result['candidates'][0]['content'].get('parts') and \
                 len(result['candidates'][0]['content']['parts']) > 0:
-
-            generated_json_str = result['candidates'][0]['content']['parts'][0]['text']
-
-            # Robust JSON parsing: try to extract JSON from potentially malformed LLM output
-            # Look for content between the first '{' and the last '}'
-            json_match = re.search(r'(\{.*\})', generated_json_str, re.DOTALL)
-            if json_match:
-                clean_json_str = json_match.group(0)  # Get the entire matched group
-            else:
-                clean_json_str = generated_json_str.strip()  # Fallback if no match, just strip whitespace
-
-            # Attempt to parse the cleaned string as JSON.
-            try:
-                scenario_plan = json.loads(clean_json_str)
-                logger.debug(f"LLM generated scenario plan (raw): {scenario_plan}")
-
-                # Post-process: Parse the 'parameters' and 'headers' strings into dictionaries for each request
-                for req in scenario_plan.get('requests', []):
-                    # Process parameters
-                    if 'parameters' in req and isinstance(req['parameters'], str):
-                        logger.debug(f"Attempting to parse parameters string: {repr(req['parameters'])}")
-                        try:
-                            req['parameters'] = json.loads(req['parameters'])
-                            if req['parameters'] is None:  # If string was 'null'
-                                req['parameters'] = {}
-                            logger.debug(f"Parameters parsed successfully: {req['parameters']}")
-                        except json.JSONDecodeError as param_e:
-                            logger.error(
-                                f"Failed to parse parameters JSON string: {param_e}. Raw: {repr(req['parameters'])}")
-                            req['parameters'] = {}  # Default to empty dict on failure
-                    elif 'parameters' not in req:
-                        req['parameters'] = {}  # Ensure parameters field always exists as a dict
-
-                    # Process headers
-                    if 'headers' in req and isinstance(req['headers'], str):
-                        logger.debug(f"Attempting to parse headers string: {repr(req['headers'])}")
-                        try:
-                            req['headers'] = json.loads(req['headers'])
-                            if req['headers'] is None:  # If string was 'null'
-                                req['headers'] = {}
-                            logger.debug(f"Headers parsed successfully: {req['headers']}")
-                        except json.JSONDecodeError as header_e:
-                            logger.error(
-                                f"Failed to parse headers JSON string: {header_e}. Raw: {repr(req['headers'])}")
-                            req['headers'] = {}  # Default to empty dict on failure
-                    elif 'headers' not in req:
-                        req['headers'] = {}  # Ensure headers field always exists as a dict
-
-                return scenario_plan
-            except json.JSONDecodeError as e:
-                st.error(f"LLM response was not valid JSON after cleaning: {e}. Raw response: {clean_json_str}")
-                logger.error(f"LLM response was not valid JSON after cleaning: {e}. Raw response: {clean_json_str}")
-                # Fallback to default if JSON parsing fails
-                scenario_plan = None  # Ensure it falls through to default generation
+            return {"suggestion": result['candidates'][0]['content']['parts'][0]['text']}
         else:
-            st.error("LLM did not return a valid scenario plan. Generating default.")
-            logger.error(f"LLM response structure unexpected: {result}")
+            logger.error(f"LLM did not return a valid suggestion structure: {result}")
+            return {"suggestion": "Could not generate a specific suggestion at this time."}
     except requests.exceptions.RequestException as e:
-        error_message = f"Error calling LLM API: {e}. "
+        error_message = f"Error calling LLM API for suggestion: {e}. "
         if e.response is not None:
             try:
                 error_details = e.response.json()
                 error_message += f"API Error Details: {json.dumps(error_details)}"
-                if e.response.status_code == 403:
-                    st.error(f"**Authentication/Permission Error (403 Forbidden):**")
-                    st.error(
-                        f"Please ensure your API Key is correct and has the necessary permissions to access the Gemini API.")
-                    st.error(
-                        f"You may need to enable the Gemini API in your Google Cloud project and check your billing settings.")
             except json.JSONDecodeError:
                 error_message += f"Raw API Error Text: {e.response.text}"
-        else:
-            error_message += "No response text."
-        st.error(error_message)
+        st.error(f"An error occurred while getting AI suggestion: {error_message}")
         logger.error(error_message)
+        return {"suggestion": f"An error occurred while getting AI suggestion: {e}"}
     except Exception as e:
-        st.error(f"An unexpected error occurred during LLM call: {e}. Generating default scenario.")
+        st.error(f"An unexpected error occurred during LLM call for suggestion: {e}")
         logger.error(f"An unexpected error occurred: {e}")
-
-    # Fallback/Default Scenario Plan if LLM call fails or returns invalid format
-    default_requests = []
-    # If scenario_plan is still None here, it means LLM failed or returned invalid JSON
-    # so we proceed with the default generation logic.
-    if scenario_plan is None:
-        for endpoint in swagger_endpoints:
-            # Simple heuristic: include GET and POST requests by default
-            if endpoint.method in ["GET", "POST"]:
-                params_for_llm = {}
-                for param in endpoint.parameters:
-                    param_name = param.get('name')
-                    mapped_db_col = existing_mappings.get(f"{endpoint.method} {endpoint.path}", {}).get(param_name)
-                    if mapped_db_col:
-                        params_for_llm[param_name] = f"${{{mapped_db_col.replace('.', '_')}}}"
-                    else:
-                        params_for_llm[param_name] = ""  # Empty or placeholder
-
-                body_content = None
-                headers_content = {}  # Default empty headers
-                if endpoint.method == "POST":
-                    # For a simple default POST, assume a JSON body if parameters exist
-                    # This needs to be smarter based on swagger 'schema' for body
-                    if endpoint.parameters:
-                        # Filter parameters that are 'in': 'body' or 'formData' for JSON body
-                        body_params = [p for p in endpoint.parameters if p.get('in') in ['body', 'formData', 'query']]
-                        if body_params:
-                            dummy_body = {}
-                            for p in body_params:
-                                param_name = p.get('name')
-                                if param_name:  # Ensure param_name is not None
-                                    mapped_db_col = existing_mappings.get(f"{endpoint.method} {endpoint.path}", {}).get(
-                                        param_name)
-                                    if mapped_db_col:
-                                        dummy_body[param_name] = f"${{{mapped_db_col.replace('.', '_')}}}"
-                                    else:
-                                        # Provide a placeholder value if no mapping
-                                        # Based on common types, providing string 'value' or random int
-                                        if p.get('type') == 'integer':
-                                            dummy_body[param_name] = "${__Random(1,1000,)}"
-                                        elif p.get('type') == 'string':
-                                            dummy_body[param_name] = "string_value"
-                                        else:
-                                            dummy_body[param_name] = "value"
-                            if dummy_body:
-                                body_content = json.dumps(dummy_body)
-                                # Add Content-Type for default POST body
-                                headers_content['Content-Type'] = 'application/json'
-
-                default_requests.append({
-                    "endpoint_key": f"{endpoint.method} {endpoint.path}",
-                    "name": f"{endpoint.method} {endpoint.path.replace('/', '_')}",
-                    "method": endpoint.method,
-                    "path": endpoint.path,
-                    "parameters": params_for_llm,
-                    "body": body_content,
-                    "use_mapping": True,
-                    "headers": headers_content  # Add headers to default request
-                })
-
-        default_scenario_plan = {
-            "test_name": "Default Generated Test Plan",
-            "thread_group": {
-                "num_users": thread_group_users,
-                "ramp_up": ramp_up_time,
-                "loop_count": loop_count,
-            },
-            "requests": default_requests
-        }
-        return default_scenario_plan
-    else:
-        return scenario_plan
+        return {"suggestion": f"An unexpected error occurred: {e}"}
 
 
 def main():
@@ -580,40 +364,61 @@ def main():
         st.session_state.db_connector = None
     if 'db_tables_schema' not in st.session_state:
         st.session_state.db_tables_schema = {}
-    # New state for API key input
     if 'gemini_api_key' not in st.session_state:
         st.session_state.gemini_api_key = ""
+    if 'current_swagger_url' not in st.session_state:
+        st.session_state.current_swagger_url = ""
+    if 'selected_endpoint_keys' not in st.session_state:
+        st.session_state.selected_endpoint_keys = []
+    if 'scenario_requests_configs' not in st.session_state:
+        st.session_state.scenario_requests_configs = []
+    if 'llm_suggestion' not in st.session_state:
+        st.session_state.llm_suggestion = ""
+    if 'enable_constant_timer' not in st.session_state:
+        st.session_state.enable_constant_timer = False
+    if 'constant_timer_delay_ms' not in st.session_state:
+        st.session_state.constant_timer_delay_ms = 300  # Default to 300 ms
+    if 'include_scenario_assertions' not in st.session_state:
+        st.session_state.include_scenario_assertions = True
 
     # Create three columns for the main inputs
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.header("🔗 Swagger Configuration")
-        # FIX: Changed default value to a clean URL string, as requested.
         swagger_url_input = st.text_input(
             "Swagger JSON URL",
             value="https://petstore.swagger.io/v2/swagger.json",
-            # Clean default
             help="Enter the URL to your Swagger/OpenAPI specification"
         )
-        # Apply cleaning to the swagger URL input field as well
         swagger_url = _clean_url_string(swagger_url_input)
         logger.debug(f"Swagger URL after cleaning: {repr(swagger_url)}")
 
-        if st.button("Fetch Swagger", key="fetch_swagger"):
-            with st.spinner("Fetching Swagger specification..."):
-                try:
-                    parser = SwaggerParser(swagger_url)
-                    endpoints = parser.extract_endpoints()
-                    st.session_state.swagger_endpoints = endpoints
-                    st.success(f"Found {len(endpoints)} API endpoints")
-                except Exception as e:
-                    st.error(f"Failed to fetch Swagger: {str(e)}")
+        if st.button("Fetch Swagger", key="fetch_swagger") or \
+                (
+                        swagger_url and swagger_url != st.session_state.current_swagger_url and not st.session_state.swagger_endpoints):
+            if swagger_url:
+                with st.spinner("Fetching Swagger specification..."):
+                    try:
+                        parser = SwaggerParser(swagger_url)
+                        endpoints = parser.extract_endpoints()
+                        st.session_state.swagger_endpoints = endpoints
+                        st.session_state.swagger_parser = parser  # Store the parser instance to access swagger_data
+                        st.session_state.current_swagger_url = swagger_url
+                        st.session_state.selected_endpoint_keys = []
+                        st.session_state.scenario_requests_configs = []
+                        st.success(f"Found {len(endpoints)} API endpoints.")
+                    except Exception as e:
+                        st.error(f"Failed to fetch Swagger: {str(e)}")
+                        st.session_state.swagger_endpoints = []
+                        st.session_state.selected_endpoint_keys = []
+                        st.session_state.scenario_requests_configs = []
+            else:
+                st.warning("Please enter a Swagger JSON URL.")
 
-        # Display endpoints if available
         if st.session_state.swagger_endpoints:
             st.subheader("API Endpoints")
-            for endpoint in st.session_state.swagger_endpoints[:5]:  # Show first 5
+            for endpoint in st.session_state.swagger_endpoints[:5]:
                 st.code(f"{endpoint.method} {endpoint.path}")
             if len(st.session_state.swagger_endpoints) > 5:
                 st.info(f"... and {len(st.session_state.swagger_endpoints) - 5} more endpoints")
@@ -621,9 +426,10 @@ def main():
     with col2:
         st.header("🗄️ Database Configuration")
 
-        db_type = st.selectbox("Database Type", ["SQLite", "MySQL", "PostgreSQL"])
+        db_type = st.selectbox("Database Type", ["SQLite", "MySQL", "PostgreSQL"], key="db_type_select")
 
         db_file = ""
+        db_config = None
         if db_type == "SQLite":
             db_file = st.text_input(
                 "Database File Path",
@@ -633,25 +439,70 @@ def main():
             db_config = DatabaseConfig(db_type="sqlite", file_path=db_file)
         else:
             st.info("MySQL/PostgreSQL support coming soon!")
-            db_config = None
 
         if st.button("Connect Database", key="connect_db") and db_config:
-            if not os.path.exists(db_file):
-                st.error(f"Database file not found at: {db_file}")
+            if db_type == "SQLite" and not os.path.exists(db_file):
+                st.error(f"Database file not found at: {db_file}. Please ensure the file exists or create it.")
+                if st.button("Create Dummy SQLite DB", key="create_dummy_db"):
+                    try:
+                        os.makedirs(os.path.dirname(db_file), exist_ok=True)
+                        conn = sqlite3.connect(db_file)
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                                       CREATE TABLE IF NOT EXISTS pets
+                                       (
+                                           id
+                                           INTEGER
+                                           PRIMARY
+                                           KEY,
+                                           name
+                                           TEXT
+                                           NOT
+                                           NULL,
+                                           status
+                                           TEXT
+                                           NOT
+                                           NULL,
+                                           tags
+                                           TEXT
+                                       );
+                                       """)
+                        cursor.execute("""
+                                       CREATE TABLE IF NOT EXISTS users
+                                       (
+                                           id
+                                           INTEGER
+                                           PRIMARY
+                                           KEY,
+                                           username
+                                           TEXT
+                                           NOT
+                                           NULL,
+                                           password
+                                           TEXT
+                                           NOT
+                                           NULL,
+                                           email
+                                           TEXT
+                                       );
+                                       """)
+                        cursor.execute(
+                            "INSERT INTO pets (name, status, tags) VALUES ('Buddy', 'available', 'dog,friendly');")
+                        cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Whiskers', 'pending', 'cat');")
+                        cursor.execute(
+                            "INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
+                        conn.commit()
+                        conn.close()
+                        st.success(f"Dummy SQLite database created at {db_file} with sample data.")
+                        st.rerun()  # Replaced st.experimental_rerun()
+                    except Exception as ex:
+                        st.error(f"Error creating dummy DB: {ex}")
             else:
                 with st.spinner("Connecting to database..."):
                     try:
-                        @st.cache_resource
-                        def get_database_connector(config):
-                            connector = DatabaseConnector(config)
-                            if connector.connect():
-                                return connector
-                            return None
-
-                        connector = get_database_connector(db_config)
-                        st.session_state.db_connector = connector
-
-                        if connector:
+                        connector = DatabaseConnector(db_config)
+                        if connector.connect():
+                            st.session_state.db_connector = connector
                             tables = connector.get_tables()
                             st.session_state.db_tables = tables
                             tables_schema = {}
@@ -664,6 +515,7 @@ def main():
                             st.error("Failed to connect to database")
                     except Exception as e:
                         st.error(f"Database connection error: {str(e)}")
+                        st.session_state.db_tables = []
 
         if st.session_state.db_tables:
             st.subheader("Database Tables")
@@ -671,186 +523,482 @@ def main():
                 st.code(table)
 
     with col3:
-        st.header("🤖 AI Prompt & API Key")
+        st.header("🤖 AI Assistance & API Key")
 
         st.session_state.gemini_api_key = st.text_input(
             "Gemini API Key",
-            type="password",  # Use password type for sensitivity
+            type="password",
             value=st.session_state.gemini_api_key,
             help="Enter your Google Gemini API Key. Get one from Google AI Studio."
         )
 
-        # Updated default prompt text
         prompt = st.text_area(
-            "Describe your test scenario",
+            "Describe your test scenario (for AI suggestions)",
             value="Generate a JMeter script that covers all available API endpoints. For each endpoint, use mapped database fields if available, otherwise generate dummy data. Aim for a typical user flow involving GET, POST, PUT, and DELETE operations where appropriate.",
             height=100
         )
 
-        with st.expander("Advanced Options"):
-            thread_group_users = st.number_input("Number of Users", min_value=1, max_value=1000, value=10,
-                                                 key="num_users")
-            ramp_up_time = st.number_input("Ramp-up Time (seconds)", min_value=1, max_value=3600, value=30,
-                                           key="ramp_up")
-            loop_count = st.number_input("Loop Count", min_value=1, max_value=100, value=1, key="loop_count")
-            base_url = st.text_input("Base URL for API (e.g., petstore.swagger.io)", value="petstore.swagger.io",
-                                     key="base_url")
-            protocol = st.selectbox("Protocol", ["http", "https"], index=1 if "https" in swagger_url else 0,
-                                    key="protocol")
-            port = st.text_input("Port (Optional)", value="", key="port")
-
-        if st.button("Generate JMeter Script", key="generate_script", type="primary"):
+        if st.button("Get AI Suggestions", key="get_ai_suggestions_btn"):
             if not st.session_state.swagger_endpoints:
-                st.error("Please fetch Swagger specification first")
+                st.error("Please fetch Swagger specification first to get AI suggestions.")
             elif not st.session_state.db_tables:
-                st.error("Please connect to database first")
-            elif not prompt.strip():
-                st.error("Please provide a test scenario description")
+                st.error("Please connect to database first to get AI suggestions for mappings.")
             elif not st.session_state.gemini_api_key.strip():
-                st.error("Please provide your Gemini API Key in the 'Gemini API Key' field.")
+                st.error("Please provide your Gemini API Key to get AI suggestions.")
             else:
-                with st.spinner("Generating JMeter script with AI..."):
-                    try:
-                        # Ensure mappings are generated first if not already
-                        if not st.session_state.mappings:
-                            # Get table schemas
-                            tables_schema_for_mapping = {}
-                            for table in st.session_state.db_tables:
-                                schema = st.session_state.db_connector.get_table_schema(table)
-                                tables_schema_for_mapping[table] = schema
-                            st.session_state.mappings = DataMapper.suggest_mappings(st.session_state.swagger_endpoints,
-                                                                                    tables_schema_for_mapping)
+                with st.spinner("Getting AI mapping and scenario suggestions..."):
+                    if not st.session_state.mappings:
+                        tables_schema_for_mapping = {}
+                        for table in st.session_state.db_tables:
+                            schema = st.session_state.db_connector.get_table_schema(table)
+                            tables_schema_for_mapping[table] = schema
+                        st.session_state.mappings = DataMapper.suggest_mappings(st.session_state.swagger_endpoints,
+                                                                                tables_schema_for_mapping)
 
-                        # Call LLM to get scenario plan, passing the API key from session state
-                        scenario_plan = call_llm_for_scenario_plan(
-                            prompt=prompt,
-                            swagger_endpoints=st.session_state.swagger_endpoints,
-                            db_tables_schema=st.session_state.db_tables_schema,
-                            existing_mappings=st.session_state.mappings,
-                            thread_group_users=thread_group_users,
-                            ramp_up_time=ramp_up_time,
-                            loop_count=loop_count,
-                            api_key=st.session_state.gemini_api_key  # Pass the API key from input
-                        )
+                    llm_response = call_llm_for_scenario_plan(
+                        prompt=prompt,
+                        swagger_endpoints=st.session_state.swagger_endpoints,
+                        db_tables_schema=st.session_state.db_tables_schema,
+                        existing_mappings=st.session_state.mappings,
+                        thread_group_users=st.session_state.num_users_input,
+                        ramp_up_time=st.session_state.ramp_up_time_input,
+                        loop_count=st.session_state.loop_count_input_specific if st.session_state.loop_count_option == "Specify iterations" else -1,
+                        api_key=st.session_state.gemini_api_key
+                    )
+                    st.session_state.llm_suggestion = llm_response.get("suggestion", "No specific suggestion provided.")
 
-                        # Check if scenario_plan was successfully generated (not None due to LLM error)
-                        if scenario_plan:
-                            # Generate JMeter JMX
-                            generator = JMeterScriptGenerator()  # Re-instantiate if needed
-                            jmx_content, csv_content = generator.generate_jmx(
-                                swagger_endpoints=st.session_state.swagger_endpoints,
-                                mappings=st.session_state.mappings,
-                                thread_group_users=thread_group_users,
-                                ramp_up_time=ramp_up_time,
-                                loop_count=loop_count,
-                                scenario_plan=scenario_plan,
-                                database_connector=st.session_state.db_connector,
-                                db_tables_schema=st.session_state.db_tables_schema
-                            )
+        if st.session_state.llm_suggestion:
+            st.subheader("AI Suggested Test Flow (Read-Only)")
+            st.markdown(st.session_state.llm_suggestion)
+            st.info("Use this as a guide to configure your scenario below.")
 
-                            # Suppress JMX content display, only offer download
-                            st.subheader("JMeter Script Generated!")
-                            # st.code(jmx_content, language="xml") # Commented out to hide from UI
+    st.header("2. Load Profile Configuration")
+    col1, col2, col3 = st.columns(3)
 
-                            # Add download button for JMX
-                            st.download_button(
-                                label="Download JMX Script",
-                                data=jmx_content,
-                                file_name="generated_test_plan.jmx",
-                                mime="application/xml"
-                            )
+    with col1:
+        num_users = st.number_input(
+            "Number of Concurrent Users (Threads)",
+            min_value=1,
+            value=10,
+            step=1,
+            key="num_users_input"
+        )
+    with col2:
+        ramp_up_time = st.number_input(
+            "Ramp-up Time (seconds)",
+            min_value=0,
+            value=30,
+            step=5,
+            key="ramp_up_time_input"
+        )
+    with col3:
+        loop_count_option = st.selectbox(
+            "Loop Count",
+            options=["Infinite", "Specify iterations"],
+            key="loop_count_option"
+        )
+        loop_count = 1
+        if loop_count_option == "Specify iterations":
+            loop_count = st.number_input(
+                "Number of Iterations",
+                min_value=1,
+                value=1,
+                step=1,
+                key="loop_count_input_specific"
+            )
+        else:
+            loop_count = -1
 
-                            if csv_content:
-                                st.subheader("Data CSV Generated!")
-                                # st.code(csv_content, language="csv") # Commented out to hide from UI
-                                st.download_button(
-                                    label="Download Data CSV",
-                                    data=csv_content,
-                                    file_name="data.csv",
-                                    mime="text/csv"
-                                )
-                                st.info(
-                                    "Place 'data.csv' in the same directory as the '.jmx' file when running JMeter.")
+    st.header("2.1 Optional Global JMeter Elements")
+    col_timer, col_assertion = st.columns(2)
 
-                            st.success("JMeter script generated successfully!")
-                        else:
-                            st.warning(
-                                "JMeter script generation skipped due to previous LLM error or empty scenario. Using default JMeter generation approach.")
-                            # Fallback to a basic JMeter script generation if LLM failed to provide a plan
-                            # This part is rudimentary and can be enhanced if LLM fails consistently
-                            st.info(
-                                "Generating a basic JMeter script based on available endpoints and mappings (without AI scenario planning).")
-                            try:
-                                # Re-using a simplified generation if scenario_plan is None
-                                generator = JMeterScriptGenerator()
-                                jmx_content_fallback, csv_content_fallback = generator.generate_jmx(
-                                    swagger_endpoints=st.session_state.swagger_endpoints,
-                                    mappings=st.session_state.mappings,
-                                    thread_group_users=thread_group_users,
-                                    ramp_up_time=ramp_up_time,
-                                    loop_count=loop_count,
-                                    scenario_plan=None,  # Explicitly tell generator to use a simple approach
-                                    database_connector=st.session_state.db_connector,
-                                    db_tables_schema=st.session_state.db_tables_schema
-                                )
-                                st.download_button(
-                                    label="Download Basic JMX Script (Fallback)",
-                                    data=jmx_content_fallback,
-                                    file_name="generated_test_plan_fallback.jmx",
-                                    mime="application/xml"
-                                )
-                                if csv_content_fallback:
-                                    st.download_button(
-                                        label="Download Data CSV (Fallback)",
-                                        data=csv_content_fallback,
-                                        file_name="data_fallback.csv",
-                                        mime="text/csv"
-                                    )
-                                st.success("Basic JMeter script generated successfully as a fallback!")
-                            except Exception as fallback_e:
-                                st.error(f"Error generating fallback JMeter script: {str(fallback_e)}")
-                                logger.exception("Error generating fallback JMeter script")
+    with col_timer:
+        st.session_state.enable_constant_timer = st.checkbox(
+            "Enable Global Constant Timer",
+            value=st.session_state.enable_constant_timer,
+            key="enable_constant_timer_checkbox"
+        )
+        if st.session_state.enable_constant_timer:
+            st.session_state.constant_timer_delay_ms = st.number_input(
+                "Constant Timer Delay (milliseconds)",
+                min_value=0,
+                value=st.session_state.constant_timer_delay_ms,
+                step=100,
+                key="constant_timer_delay_input",
+                help="Delay (in ms) to pause between requests. This is applied globally to the Thread Group."
+            )
+        else:
+            st.session_state.constant_timer_delay_ms = 0
 
+    with col_assertion:
+        st.session_state.include_scenario_assertions = st.checkbox(
+            "Include Response Assertions in Scenario",
+            value=st.session_state.include_scenario_assertions,
+            key="include_scenario_assertions_checkbox",
+            help="If unchecked, no assertion configuration fields will be shown or generated for any request. A default 'Response Code 200' will be added if enabled."
+        )
 
-                    except Exception as e:
-                        st.error(f"Error during script generation: {str(e)}")
-                        logger.exception("Error during script generation")
+    st.header("3. Select Endpoints for Scenario")
+    if st.session_state.swagger_endpoints:
+        endpoint_options = [f"{ep.method} {ep.path}" for ep in st.session_state.swagger_endpoints]
 
-    # Data Mapping Section (kept for structure)
-    if st.session_state.swagger_endpoints and st.session_state.db_tables:
-        st.header("🔄 Data Mapping")
+        selected_endpoint_keys = st.multiselect(
+            "Select API Endpoints for your scenario (order reflects execution sequence)",
+            options=endpoint_options,
+            default=st.session_state.selected_endpoint_keys,
+            key="endpoint_selector"
+        )
 
-        if st.button("Generate AI Mapping Suggestions", key="generate_mapping_btn"):
-            with st.spinner("Generating mapping suggestions..."):
-                tables_schema = {}
+        if selected_endpoint_keys != st.session_state.selected_endpoint_keys:
+            st.session_state.selected_endpoint_keys = selected_endpoint_keys
+            new_scenario_configs = []
+
+            if not st.session_state.mappings and st.session_state.db_tables:
+                tables_schema_for_mapping = {}
                 for table in st.session_state.db_tables:
                     schema = st.session_state.db_connector.get_table_schema(table)
-                    tables_schema[table] = schema
-                mappings = DataMapper.suggest_mappings(st.session_state.swagger_endpoints, tables_schema)
-                st.session_state.mappings = mappings
+                    tables_schema_for_mapping[table] = schema
+                st.session_state.mappings = DataMapper.suggest_mappings(st.session_state.swagger_endpoints,
+                                                                        tables_schema_for_mapping)
 
-        # Display mappings
-        if st.session_state.mappings:
-            st.subheader("Suggested Parameter Mappings")
-            for endpoint, params in st.session_state.mappings.items():
-                if params:  # Only show endpoints with mappings
-                    st.write(f"**{endpoint}**")
-                    for param, mapping in params.items():
-                        st.write(f"  • `{param}` → `{mapping}`")
-            else:
-                st.info("No mappings suggested.")
+            for ep_key in selected_endpoint_keys:
+                current_endpoint = next(
+                    (ep for ep in st.session_state.swagger_endpoints if f"{ep.method} {ep.path}" == ep_key), None)
 
-    # Database Preview Section
-    if 'db_connector' in st.session_state and st.session_state.db_tables:
-        st.header("📊 Database Preview")
-        selected_table = st.selectbox("Select table to preview", st.session_state.db_tables, key="db_preview_table")
-        if selected_table:
-            preview_df = st.session_state.db_connector.preview_data(selected_table)
-            if not preview_df.empty:
-                st.dataframe(preview_df)
+                if current_endpoint:
+                    request_config = {
+                        "endpoint_key": ep_key,
+                        "name": f"{current_endpoint.method} {current_endpoint.path.replace('/', '_')}",
+                        "method": current_endpoint.method,
+                        "path": current_endpoint.path,
+                        "parameters": {},
+                        "headers": {},
+                        "body": None,
+                        "assertions": [],
+                        "json_extractors": [],
+                        "think_time": 0
+                    }
+
+                    if current_endpoint.parameters:
+                        for param in current_endpoint.parameters:
+                            if param.get('in') in ['query', 'path']:
+                                mapped_value = st.session_state.mappings.get(ep_key, {}).get(param['name'], None)
+                                if mapped_value:
+                                    request_config['parameters'][param['name']] = f"${{{mapped_value}}}"
+                                else:
+                                    if param.get('type') == 'string':
+                                        request_config['parameters'][param['name']] = f"dummy_{param['name']}"
+                                    elif param.get('type') == 'integer':
+                                        request_config['parameters'][param['name']] = "123"
+                                    elif param.get('type') == 'boolean':
+                                        request_config['parameters'][param['name']] = "true"
+                                    else:
+                                        request_config['parameters'][param['name']] = f"dummy_{param['name']}"
+
+                    if current_endpoint.method in ["POST", "PUT", "PATCH"]:
+                        request_config["headers"] = {"Content-Type": "application/json"}
+                        if current_endpoint.request_body and st.session_state.get('swagger_parser'):
+                            try:
+                                def resolve_ref(schema_obj, definitions):
+                                    if '$ref' in schema_obj:
+                                        ref_path = schema_obj['$ref'].split('/')
+                                        definition_name = ref_path[-1]
+                                        return definitions.get(definition_name, {})
+                                    return schema_obj
+
+                                definitions = st.session_state.swagger_parser.swagger_data.get('definitions', {})
+                                resolved_schema = resolve_ref(current_endpoint.request_body, definitions)
+                                def_props = resolved_schema.get('properties', {})
+
+                                if def_props:
+                                    dummy_body = {}
+                                    for prop_name, prop_details in def_props.items():
+                                        if prop_details.get('type') == 'string':
+                                            dummy_body[prop_name] = f"auto_{prop_name}"
+                                        elif prop_details.get('type') == 'integer':
+                                            dummy_body[prop_name] = 456
+                                        elif prop_details.get('type') == 'boolean':
+                                            dummy_body[prop_name] = True
+                                        else:
+                                            dummy_body[prop_name] = f"auto_value_{prop_name}"
+                                    request_config["body"] = json.dumps(dummy_body, indent=2)
+                                else:
+                                    request_config["body"] = "{\n  \"message\": \"auto-generated dummy body\"\n}"
+                            except Exception as e:
+                                logger.warning(f"Could not infer request body from schema for {ep_key}: {e}")
+                                request_config["body"] = "{\n  \"message\": \"auto-generated dummy body\"\n}"
+                        else:
+                            request_config["body"] = "{\n  \"message\": \"auto-generated dummy body\"\n}"
+
+                    if st.session_state.include_scenario_assertions:
+                        request_config['assertions'].append({"type": "Response Code", "value": "200"})
+
+                    new_scenario_configs.append(request_config)
+
+            st.session_state.scenario_requests_configs = new_scenario_configs
+            st.rerun()  # Replaced st.experimental_rerun()
+
+        st.markdown("---")
+        st.subheader("Selected Endpoints (Auto-Configured)")
+        if st.session_state.scenario_requests_configs:
+            for i, config in enumerate(st.session_state.scenario_requests_configs):
+                st.code(f"Request {i + 1}: {config['method']} {config['path']}")
+                with st.expander(f"View Auto-Configuration for {config['name']}"):
+                    st.json(config)
+        else:
+            st.info("Select endpoints above to auto-configure their details.")
+
+    else:
+        st.info("Please fetch a Swagger file to build your test scenario.")
+
+    st.markdown("---")
+
+    if st.button("Generate JMeter Script", key="generate_button_final", type="primary"):
+        if not st.session_state.swagger_endpoints:
+            st.error("Please fetch a Swagger/OpenAPI JSON file and ensure endpoints are parsed.")
+            return
+        if not st.session_state.selected_endpoint_keys:
+            st.error("Please select at least one API request to include in your scenario.")
+            return
+
+        st.info("Generating JMeter script... Please wait.")
+
+        try:
+            scenario_plan = {"requests": st.session_state.scenario_requests_configs}
+
+            num_users = st.session_state.num_users_input
+            ramp_up_time = st.session_state.ramp_up_time_input
+            loop_count = st.session_state.loop_count_input_specific if st.session_state.loop_count_option == "Specify iterations" else -1
+
+            global_constant_timer_delay = st.session_state.constant_timer_delay_ms if st.session_state.enable_constant_timer else 0
+
+            generator = JMeterScriptGenerator()
+            jmx_content, csv_content = generator.generate_jmx(
+                app_base_url=swagger_url,
+                thread_group_users=num_users,
+                ramp_up_time=ramp_up_time,
+                loop_count=loop_count,
+                scenario_plan=scenario_plan,
+                csv_data=None,
+                global_constant_timer_delay=global_constant_timer_delay
+            )
+
+            st.success("JMeter script generated successfully!")
+
+            st.subheader("Generated JMeter Test Plan (.jmx)")
+            st.code(jmx_content, language="xml")
+
+            st.download_button(
+                label="Download JMX File",
+                data=jmx_content.encode("utf-8"),
+                file_name="generated_test_plan.jmx",
+                mime="application/xml",
+                key="download_jmx_final"
+            )
+
+            if csv_content:
+                st.subheader("Generated CSV Data (data.csv)")
+                st.code(csv_content, language="csv")
+                st.download_button(
+                    label="Download CSV File",
+                    data=csv_content.encode("utf-8"),
+                    file_name="data.csv",
+                    mime="text/csv",
+                    key="download_csv_final"
+                )
             else:
-                st.info("No data found in selected table")
+                st.info("No CSV data was generated for this test plan.")
+
+        except Exception as e:
+            st.error(f"An error occurred during script generation: {e}")
+            logger.error(f"Error in main app execution: {e}", exc_info=True)
+
+    st.markdown("---")
+    st.markdown("Developed with ❤️ by Your AI Assistant")
 
 
 if __name__ == "__main__":
+    if not os.path.exists("swagger.json"):
+        dummy_swagger_content = """
+{
+  "swagger": "2.0",
+  "info": {
+    "version": "1.0.0",
+    "title": "Swagger Petstore"
+  },
+  "host": "petstore.swagger.io",
+  "basePath": "/v2",
+  "schemes": [
+    "https"
+  ],
+  "paths": {
+    "/pet/findByStatus": {
+      "get": {
+        "summary": "Finds Pets by status",
+        "operationId": "findPetsByStatus",
+        "produces": [
+          "application/xml",
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Status values that need to be considered for filter",
+            "required": true,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "available",
+                "pending",
+                "sold"
+              ],
+              "default": "available"
+            },
+            "collectionFormat": "multi"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation"
+          }
+        }
+      }
+    },
+    "/user": {
+      "post": {
+        "summary": "Create user",
+        "operationId": "createUser",
+        "produces": [
+          "application/xml",
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "description": "Created user object",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/User"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "successful operation"
+          }
+        }
+      }
+    },
+    "/login": {
+      "post": {
+        "summary": "Logs user into the system",
+        "operationId": "loginUser",
+        "produces": [
+          "application/xml",
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "username",
+            "in": "query",
+            "description": "The user name for login",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "password",
+            "in": "query",
+            "description": "The password for login in clear text",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation"
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "User": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "username": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
+        """
+        with open("swagger.json", "w") as f:
+            f.write(dummy_swagger_content)
+        logger.info("Created a dummy swagger.json file for demonstration.")
+
+    dummy_db_path = "database/petstore.db"
+    if not os.path.exists(dummy_db_path):
+        try:
+            os.makedirs(os.path.dirname(dummy_db_path), exist_ok=True)
+            conn = sqlite3.connect(dummy_db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                           CREATE TABLE IF NOT EXISTS pets
+                           (
+                               id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               name
+                               TEXT
+                               NOT
+                               NULL,
+                               status
+                               TEXT
+                               NOT
+                               NULL,
+                               tags
+                               TEXT
+                           );
+                           """)
+            cursor.execute("""
+                           CREATE TABLE IF NOT EXISTS users
+                           (
+                               id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               username
+                               TEXT
+                               NOT
+                               NULL,
+                               password
+                               TEXT
+                               NOT
+                               NULL,
+                               email
+                               TEXT
+                           );
+                           """)
+            cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Buddy', 'available', 'dog,friendly');")
+            cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Whiskers', 'pending', 'cat');")
+            cursor.execute(
+                "INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
+            conn.commit()
+            conn.close()
+            logger.info(f"Dummy SQLite database created at {dummy_db_path} with sample data.")
+        except Exception as ex:
+            logger.error(f"Error creating dummy DB during __main__ init: {ex}")
+
     main()
