@@ -16,22 +16,51 @@ logger = logging.getLogger(__name__)
 class JMeterScriptGenerator:
     def __init__(self):
         # Align jmeter version with the user's working JMX for better compatibility
-        self.test_plan_root = ET.Element("jmeterTestPlan", version="1.2", properties="5.0", jmeter="5.2.1")
-        hash_tree = ET.SubElement(self.test_plan_root, "hashTree")
+        # Keeping 5.2.1 as it's the version from the user's working JMX reference,
+        # and more likely to be compatible with older XStream if that's the issue.
+        self.test_plan_root = ET.Element("jmeterTestPlan", version="1.2", properties="5.0",
+                                         jmeter="5.6.3")  # Updated JMeter version
 
-        self.test_plan = self._create_element(hash_tree, "TestPlan", attrib={
+        # This is the outermost hashTree element, a sibling to the TestPlan itself
+        self.root_hash_tree_container = ET.SubElement(self.test_plan_root, "hashTree")
+
+        # TestPlan element: Child of the root_hash_tree_container
+        self.test_plan = self._create_element(self.root_hash_tree_container, "TestPlan", attrib={
             "guiclass": "TestPlanGui",
             "testclass": "TestPlan",
-            "testname": "Test Plan",
+            "testname": "Web Application Performance Test",  # User specified name
             "enabled": "true"
         })
-        test_plan_hash_tree = self._create_element(self.test_plan, "hashTree")
-        self.elements = test_plan_hash_tree  # This will be the main container for thread groups and other elements
+        self._create_string_prop(self.test_plan, "TestPlan.comments",
+                                 "A test plan to evaluate the performance of a web application under load.")  # User specified
+        self._create_bool_prop(self.test_plan, "TestPlan.functional_mode", False)  # User specified
+        self._create_bool_prop(self.test_plan, "TestPlan.tearDown_on_shutdown", True)  # User specified
+        self._create_bool_prop(self.test_plan, "TestPlan.serialize_threadgroups", False)  # User specified
 
-        # Default HTTP Request Defaults
-        # Call add_http_request_defaults here, which will add the ConfigTestElement
-        # and its sibling hashTree to self.elements
-        self.add_http_request_defaults(self.elements)
+        # User Defined Variables for TestPlan (Exact element as specified)
+        user_defined_variables = self._create_element(self.test_plan, "elementProp", {
+            "name": "TestPlan.user_defined_variables",
+            "elementType": "Arguments",
+            "guiclass": "ArgumentsPanel",
+            "testclass": "Arguments",
+            "testname": "User Defined Variables",
+            "enabled": "true"
+        })
+        self._create_collection_prop(user_defined_variables, "Arguments.arguments")
+        self._create_string_prop(self.test_plan, "TestPlan.user_define_classpath", "")
+
+        # TestPlan's SIBLING hashTree - this will contain HTTP Defaults, Thread Groups, Listeners
+        self.test_plan_children_hash_tree = ET.SubElement(self.root_hash_tree_container, "hashTree")
+
+        # Default HTTP Request Defaults (add as child of test_plan_children_hash_tree)
+        http_defaults = self.add_http_request_defaults(self.test_plan_children_hash_tree,
+                                                       protocol="https",
+                                                       domain="example.com",  # User specified domain
+                                                       connect_timeout="5000",  # User specified 5s (in ms)
+                                                       response_timeout="10000")  # User specified 10s (in ms)
+
+        # SIBLING hashTree for HTTP Request Defaults
+        self.http_defaults_children_hash_tree = ET.SubElement(self.test_plan_children_hash_tree, "hashTree")
 
         # CSV Data Set Config placeholder, added if needed later
         self.csv_config = None
@@ -55,7 +84,8 @@ class JMeterScriptGenerator:
         prop.text = "true" if value else "false"
         return prop
 
-    def add_http_request_defaults(self, parent, protocol="https", domain="petstore.swagger.io", port=""):
+    def add_http_request_defaults(self, parent, protocol="https", domain="petstore.swagger.io", port="",
+                                  connect_timeout="", response_timeout=""):
         config = self._create_element(parent, "ConfigTestElement", {
             "guiclass": "HttpDefaultsGui",
             "testclass": "HttpDefaults",
@@ -81,43 +111,41 @@ class JMeterScriptGenerator:
         self._create_string_prop(config, "HTTPSampler.protocol", protocol)
         self._create_string_prop(config, "HTTPSampler.domain", domain)
         self._create_string_prop(config, "HTTPSampler.port", str(port))
-        self._create_string_prop(config, "HTTPSampler.contentEncoding", "")  # Added as per working JMX
-        self._create_string_prop(config, "HTTPSampler.proxyHost", "")  # Added as per working JMX
-        self._create_string_prop(config, "HTTPSampler.proxyPort", "")  # Added as per working JMX
-        self._create_string_prop(config, "HTTPSampler.proxyUser", "")  # Added as per working JMX
-        self._create_string_prop(config, "HTTPSampler.proxyPass", "")  # Added as per working JMX
-        self._create_string_prop(config, "HTTPSampler.connect_timeout", "")
-        self._create_string_prop(config, "HTTPSampler.response_timeout", "")
+        self._create_string_prop(config, "HTTPSampler.contentEncoding", "")  # User specified
+        self._create_string_prop(config, "HTTPSampler.proxyHost", "")
+        self._create_string_prop(config, "HTTPSampler.proxyPort", "")
+        self._create_string_prop(config, "HTTPSampler.proxyUser", "")
+        self._create_string_prop(config, "HTTPSampler.proxyPass", "")
+        self._create_string_prop(config, "HTTPSampler.connect_timeout", connect_timeout)  # User specified
+        self._create_string_prop(config, "HTTPSampler.response_timeout", response_timeout)  # User specified
 
         # 3. Boolean Properties (direct children of config)
-        # Order within string/bool props is less critical but following working JMX
-        self._create_bool_prop(config, "HTTPSampler.send_chunked_post_body", False)  # Corrected to boolProp
-        self._create_bool_prop(config, "HTTPSampler.follow_redirects", True)
-        self._create_bool_prop(config, "HTTPSampler.auto_redirects", False)
-        self._create_bool_prop(config, "HTTPSampler.use_keepalive", True)
+        self._create_bool_prop(config, "HTTPSampler.send_chunked_post_body", False)
+        self._create_bool_prop(config, "HTTPSampler.follow_redirects", True)  # User specified
+        self._create_bool_prop(config, "HTTPSampler.auto_redirects", False)  # User specified
+        self._create_bool_prop(config, "HTTPSampler.use_keepalive", True)  # User specified
         self._create_bool_prop(config, "HTTPSampler.DO_MULTIPART_POST", False)
         self._create_bool_prop(config, "HTTPSampler.BROWSER_COMPATIBLE_MULTIPART", True)
-        self._create_bool_prop(config, "HTTPSampler.concurrentDwn", False)  # Common JMeter default (if needed)
+        self._create_bool_prop(config, "HTTPSampler.concurrentDwn", False)
 
-        # Crucial: An empty hashTree as a SIBLING to ConfigTestElement, not a child
-        # This hashTree marks the end of the ConfigTestElement's scope/children
-        self._create_element(parent, "hashTree")
+        # No internal hashTree for ConfigTestElement
+        return config
 
     def add_thread_group(self, num_users, ramp_up_time, loop_count, parent_element):
         thread_group = self._create_element(parent_element, "ThreadGroup", {
             "guiclass": "ThreadGroupGui",
             "testclass": "ThreadGroup",
-            "testname": "Users",
+            "testname": "Main Users",  # User specified name
             "enabled": "true"
         })
-        self._create_string_prop(thread_group, "ThreadGroup.on_sample_error", "continue")  # Direct string prop
+        self._create_string_prop(thread_group, "ThreadGroup.on_sample_error", "continue")  # User specified
 
-        self._create_string_prop(thread_group, "ThreadGroup.num_threads", str(num_users))
-        self._create_string_prop(thread_group, "ThreadGroup.ramp_time", str(ramp_up_time))
+        self._create_string_prop(thread_group, "ThreadGroup.num_threads", str(num_users))  # User specified
+        self._create_string_prop(thread_group, "ThreadGroup.ramp_time", str(ramp_up_time))  # User specified
         self._create_bool_prop(thread_group, "ThreadGroup.scheduler", False)
         self._create_string_prop(thread_group, "ThreadGroup.duration", "")
         self._create_string_prop(thread_group, "ThreadGroup.delay", "")
-        self._create_bool_prop(thread_group, "ThreadGroup.same_user_on_next_iteration", True)
+        self._create_bool_prop(thread_group, "ThreadGroup.same_user_on_next_iteration", True)  # User specified
 
         # Check if loop_count is -1 for infinite or a positive integer
         if loop_count == -1:
@@ -141,34 +169,31 @@ class JMeterScriptGenerator:
                 "enabled": "true"
             })
             self._create_bool_prop(main_controller, "LoopController.continue_forever", False)
-            self._create_string_prop(main_controller, "LoopController.loops", str(loop_count))
+            self._create_string_prop(main_controller, "LoopController.loops", str(loop_count))  # User specified
 
-        thread_group_hash_tree = self._create_element(thread_group, "hashTree")
-        return thread_group_hash_tree
+        # No internal hashTree for ThreadGroup here, it will be a sibling
+        return thread_group
 
-    def add_http_sampler(self, parent_element, name, method, path, parameters=None, body=None,
-                         headers=None) -> ET.Element:  # Added return type hint for sampler_hash_tree
+    # add_http_sampler now only creates the sampler itself, not its child hashTree
+    def add_http_sampler(self, parent_element, name, method, path, parameters=None, body=None) -> ET.Element:
         sampler = self._create_element(parent_element, "HTTPSamplerProxy", {
             "guiclass": "HttpTestSampleGui",
             "testclass": "HTTPSamplerProxy",
             "testname": name,
             "enabled": "true"
         })
-        # This is the hashTree that contains children elements scoped to this sampler
-        sampler_hash_tree = self._create_element(sampler, "hashTree")
 
-        # Sampler properties (direct children of sampler)
+        # --- IMPORTANT: All direct properties of HTTPSamplerProxy must come BEFORE its SIBLING hashTree ---
         self._create_string_prop(sampler, "HTTPSampler.method", method)
         self._create_string_prop(sampler, "HTTPSampler.path", path)
         self._create_bool_prop(sampler, "HTTPSampler.auto_redirects", False)
         self._create_bool_prop(sampler, "HTTPSampler.follow_redirects", True)
         self._create_bool_prop(sampler, "HTTPSampler.use_keepalive", True)
-        self._create_string_prop(sampler, "HTTPSampler.embedded_url_দোষ", "")
         self._create_string_prop(sampler, "HTTPSampler.connect_timeout", "")
         self._create_string_prop(sampler, "HTTPSampler.response_timeout", "")
 
         # Arguments for parameters (URL parameters or form data)
-        arguments = self._create_element(sampler, "elementProp", {  # Child of sampler
+        arguments = self._create_element(sampler, "elementProp", {
             "name": "HTTPsampler.Arguments",
             "elementType": "Arguments",
             "guiclass": "HTTPArgumentsPanel",
@@ -190,12 +215,10 @@ class JMeterScriptGenerator:
 
         # For POST/PUT requests with JSON bodies
         if method in ["POST", "PUT", "PATCH"] and body:
-            post_data = self._create_element(sampler, "boolProp",
-                                             {"name": "HTTPSampler.postBodyRaw"})  # Child of sampler
-            post_data.text = "true"
+            self._create_bool_prop(sampler, "HTTPSampler.postBodyRaw", True)
 
-            body_data = self._create_element(sampler, "elementProp", {  # Child of sampler
-                "name": "HTTPsampler.Arguments",  # This name is also used for raw body data
+            body_data = self._create_element(sampler, "elementProp", {
+                "name": "HTTPsampler.Arguments",  # This name is correct for raw body
                 "elementType": "Arguments",
                 "guiclass": "HTTPArgumentsPanel",
                 "testclass": "Arguments",
@@ -209,31 +232,10 @@ class JMeterScriptGenerator:
             })
             self._create_bool_prop(http_argument, "HTTPArgument.always_encode", False)
             self._create_string_prop(http_argument, "Argument.value", body)
-            self._create_string_prop(http_argument, "Argument.metadata", "=")  # For raw body, metadata is just "="
+            self._create_string_prop(http_argument, "Argument.metadata", "=")
 
-        # Add Header Manager if headers are provided
-        if headers:
-            header_manager = self._create_element(sampler_hash_tree, "HeaderManager",
-                                                  {  # HeaderManager is a child of sampler_hash_tree
-                                                      "guiclass": "HeaderPanel",
-                                                      "testclass": "HeaderManager",
-                                                      "testname": "HTTP Header Manager",
-                                                      "enabled": "true"
-                                                  })
-            header_collection_prop = self._create_collection_prop(header_manager, "HeaderManager.headers")
-            for header_name, header_value in headers.items():
-                header_element = self._create_element(header_collection_prop, "elementProp", {
-                    "name": "",
-                    "elementType": "Header"
-                })
-                self._create_string_prop(header_element, "Header.name", header_name)
-                self._create_string_prop(header_element, "Header.value", header_value)
-            # FIX: REMOVED THE INCORRECT HASH TREE: self._create_element(header_manager, "hashTree")
-            # The HeaderManager does *not* have an internal hashTree.
-            # Its hashTree for scoping children (e.g., Assertions scoped to HeaderManager) is its own hashTree
-            # which is *not* what the ClassCastException was about. The error was due to the extra hashTree inside HeaderManager.
-
-        return sampler_hash_tree  # Return the hash_tree so other elements can be added to it
+        # No internal hashTree for Sampler, it will be a sibling
+        return sampler
 
     def add_csv_data_config(self, parent_element, filename, variable_names, delimiter=",", quoted_data=False):
         csv_config_element = self._create_element(parent_element, "CSVDataSet", {
@@ -251,8 +253,8 @@ class JMeterScriptGenerator:
         self._create_bool_prop(csv_config_element, "stopThread", False)
         self._create_string_prop(csv_config_element, "shareMode", "shareMode.all")
 
-        self._create_element(csv_config_element, "hashTree")  # Empty hash tree for CSV config
-        self.csv_config = csv_config_element  # Store reference to add if needed
+        # No internal hashTree for CSVDataSet, it will be a sibling
+        return csv_config_element
 
     def add_response_assertion(self, parent_element, name, response_field, test_type, pattern):
         assertion = self._create_element(parent_element, "ResponseAssertion", {
@@ -261,16 +263,19 @@ class JMeterScriptGenerator:
             "testname": name,
             "enabled": "true"
         })
-        assertion_hash_tree = self._create_element(assertion, "hashTree")
+        # ResponseAssertion properties
+        test_strings_prop = self._create_collection_prop(assertion, "Assertion.test_strings")
+        self._create_string_prop(test_strings_prop, "TestString", pattern)
 
-        self._create_collection_prop(assertion, "Asserion.test_strings")
-        self._create_string_prop(assertion_hash_tree, "Assertion.custom_message", "")
-        self._create_string_prop(assertion_hash_tree, "Assertion.test_field",
-                                 response_field)  # "Response Data", "Response Code", etc.
-        self._create_string_prop(assertion_hash_tree, "Assertion.test_type",
-                                 test_type)  # "Contains", "Matches", "Equals", "Substring"
-        self._create_string_prop(assertion_hash_tree, "Assertion.assume_success", "false")
-        self._create_collection_prop(assertion_hash_tree, "Asserion.test_strings").text = pattern  # pattern to match
+        self._create_string_prop(assertion, "Assertion.custom_message", "")
+        self._create_string_prop(assertion, "Assertion.test_field", response_field)
+        self._create_string_prop(assertion, "Assertion.test_type", test_type)
+        self._create_bool_prop(assertion, "Assertion.assume_success", False)
+        self._create_string_prop(assertion, "Assertion.scope", "variable")
+        self._create_bool_prop(assertion, "Assertion.override_existing_properties", False)
+
+        # No internal hashTree for ResponseAssertion, it will be a sibling
+        return assertion
 
     def add_json_extractor(self, parent_element, name, json_path_expr, var_name, match_no="1",
                            default_value="NOT_FOUND"):
@@ -286,7 +291,120 @@ class JMeterScriptGenerator:
         self._create_string_prop(extractor, "JSONPostProcessor.defaultValues", default_value)
         self._create_string_prop(extractor, "JSONPostProcessor.scope", "body")  # Default scope to body
 
-        self._create_element(extractor, "hashTree")  # Empty hash tree for extractor
+        # No internal hashTree for JSONPostProcessor, it will be a sibling
+        return extractor
+
+    def add_header_manager(self, parent_element, headers: Dict[str, str], name="HTTP Header Manager"):
+        header_manager = self._create_element(parent_element, "HeaderManager", {
+            "guiclass": "HeaderPanel",
+            "testclass": "HeaderManager",
+            "testname": name,
+            "enabled": "true"
+        })
+        header_collection_prop = self._create_collection_prop(header_manager, "HeaderManager.headers")
+        for header_name, header_value in headers.items():
+            header_element = self._create_element(header_collection_prop, "elementProp", {
+                "name": "",
+                "elementType": "Header"
+            })
+            self._create_string_prop(header_element, "Header.name", header_name)
+            self._create_string_prop(header_element, "Header.value", header_value)
+        # No internal hashTree for HeaderManager, it will be a sibling
+        return header_manager
+
+    def add_view_results_tree_listener(self, parent_element, name="View Results Tree"):
+        listener = self._create_element(parent_element, "ResultCollector", {
+            "guiclass": "ViewResultsFullVisualizer",  # Updated guiclass name
+            "testclass": "ResultCollector",
+            "testname": name,
+            "enabled": "true"
+        })
+        self._create_bool_prop(listener, "ResultCollector.error_logging", False)
+        obj_prop = self._create_element(listener, "objProp")
+        name_elem = self._create_element(obj_prop, "name")
+        name_elem.text = "saveConfig"
+
+        value_elem = self._create_element(obj_prop, "value", {"class": "SampleSaveConfiguration"})
+        # Corrected: Create direct elements for boolean flags instead of boolProp
+        self._create_element(value_elem, "time").text = "true"
+        self._create_element(value_elem, "latency").text = "true"
+        self._create_element(value_elem, "timestamp").text = "true"
+        self._create_element(value_elem, "success").text = "true"
+        self._create_element(value_elem, "label").text = "true"
+        self._create_element(value_elem, "code").text = "true"
+        self._create_element(value_elem, "message").text = "true"
+        self._create_element(value_elem, "threadName").text = "true"
+        self._create_element(value_elem, "dataType").text = "true"
+        self._create_element(value_elem, "encoding").text = "false"
+        self._create_element(value_elem, "assertions").text = "true"
+        self._create_element(value_elem, "subresults").text = "true"
+        self._create_element(value_elem, "responseData").text = "false"
+        self._create_element(value_elem, "samplerData").text = "false"
+        self._create_element(value_elem, "xml").text = "false"
+        # Corrected: fieldNames should also be a direct element, not stringProp
+        self._create_element(value_elem, "fieldNames").text = "true"
+        self._create_element(value_elem, "responseHeaders").text = "false"
+        self._create_element(value_elem, "requestHeaders").text = "false"
+        self._create_element(value_elem, "responseDataOnError").text = "false"
+        self._create_element(value_elem, "saveAssertionResultsFailureMessage").text = "true"
+        # Corrected: assertionsResultsToSave should also be a direct element, not stringProp
+        self._create_element(value_elem, "assertionsResultsToSave").text = "0"
+        self._create_element(value_elem, "bytes").text = "true"
+        self._create_element(value_elem, "sentBytes").text = "true"
+        self._create_element(value_elem, "url").text = "true"
+        self._create_element(value_elem, "threadCounts").text = "true"
+        self._create_element(value_elem, "idleTime").text = "true"
+        self._create_element(value_elem, "connectTime").text = "true"
+
+        # No internal hashTree for ResultCollector, it will be a sibling
+        return listener
+
+    def add_summary_report_listener(self, parent_element, name="Summary Report"):
+        listener = self._create_element(parent_element, "ResultCollector", {
+            "guiclass": "SummaryReport",  # Updated guiclass name
+            "testclass": "ResultCollector",
+            "testname": name,
+            "enabled": "true"
+        })
+        self._create_bool_prop(listener, "ResultCollector.error_logging", False)
+        obj_prop = self._create_element(listener, "objProp")
+        name_elem = self._create_element(obj_prop, "name")
+        name_elem.text = "saveConfig"
+
+        value_elem = self._create_element(obj_prop, "value", {"class": "SampleSaveConfiguration"})
+        # Corrected: Create direct elements for boolean flags instead of boolProp
+        self._create_element(value_elem, "time").text = "true"
+        self._create_element(value_elem, "latency").text = "true"
+        self._create_element(value_elem, "timestamp").text = "true"
+        self._create_element(value_elem, "success").text = "true"
+        self._create_element(value_elem, "label").text = "true"
+        self._create_element(value_elem, "code").text = "true"
+        self._create_element(value_elem, "message").text = "true"
+        self._create_element(value_elem, "threadName").text = "true"
+        self._create_element(value_elem, "dataType").text = "true"
+        self._create_element(value_elem, "encoding").text = "false"
+        self._create_element(value_elem, "assertions").text = "true"
+        self._create_element(value_elem, "subresults").text = "true"
+        self._create_element(value_elem, "responseData").text = "false"
+        self._create_element(value_elem, "samplerData").text = "false"
+        self._create_element(value_elem, "xml").text = "false"
+        # Corrected: fieldNames should also be a direct element, not stringProp
+        self._create_element(value_elem, "fieldNames").text = "true"
+        self._create_element(value_elem, "responseHeaders").text = "false"
+        self._create_element(value_elem, "requestHeaders").text = "false"
+        self._create_element(value_elem, "responseDataOnError").text = "false"
+        self._create_element(value_elem, "saveAssertionResultsFailureMessage").text = "true"
+        # Corrected: assertionsResultsToSave should also be a direct element, not stringProp
+        self._create_element(value_elem, "assertionsResultsToSave").text = "0"
+        self._create_element(value_elem, "bytes").text = "true"
+        self._create_element(value_elem, "sentBytes").text = "true"
+        self._create_element(value_elem, "url").text = "true"
+        self._create_element(value_elem, "threadCounts").text = "true"
+        self._create_element(value_elem, "idleTime").text = "true"
+        self._create_element(value_elem, "connectTime").text = "true"
+
+        # No internal hashTree for ResultCollector, it will be a sibling
+        return listener
 
     def generate_jmx(self, swagger_endpoints: List[SwaggerEndpoint],
                      mappings: Dict[str, Dict[str, str]],
@@ -297,106 +415,159 @@ class JMeterScriptGenerator:
                      database_connector: Any,  # DatabaseConnector instance
                      db_tables_schema: Dict[str, List[Dict[str, str]]]) -> (str, Optional[str]):
 
-        # Initialize thread group
-        thread_group_elements = self.add_thread_group(
-            num_users=scenario_plan['thread_group'].get('num_users', thread_group_users),
-            ramp_up_time=scenario_plan['thread_group'].get('ramp_up', ramp_up_time),
-            loop_count=scenario_plan['thread_group'].get('loop_count', loop_count),
-            parent_element=self.elements
+        # HTTP Request Defaults is already added in __init__ along with its sibling hashTree
+        # self.http_defaults_children_hash_tree is the correct container for any children of HTTP Defaults (usually empty)
+
+        # Step 1: Add Thread Group
+        thread_group_element = self.add_thread_group(
+            num_users=thread_group_users,
+            ramp_up_time=ramp_up_time,
+            loop_count=loop_count,
+            parent_element=self.test_plan_children_hash_tree  # ThreadGroup is a child of TestPlan's children hashTree
         )
+        # SIBLING hashTree for the Thread Group. This will contain all samplers, assertions, etc.
+        thread_group_children_hash_tree = self._create_element(self.test_plan_children_hash_tree, "hashTree")
 
         csv_content = None
-        csv_data_needed = False
-        csv_columns = set()
+        # Collect data from DB for mapped parameters if database_connector is provided
+        csv_data = {}
+        csv_headers = []
+        if database_connector and db_tables_schema:
+            unique_mapped_columns = set()
+            for endpoint_key, param_map in mappings.items():
+                for param_name, db_column_ref in param_map.items():
+                    unique_mapped_columns.add(db_column_ref)
 
-        # Collect all mapped parameters that will need CSV data
-        mapped_parameters_to_collect = {}  # { "table_name.column_name": set of request_data }
-
-        for request_data in scenario_plan['requests']:
-            endpoint_key = request_data['endpoint_key']
-            parameters_from_llm = request_data.get('parameters', {})
-            if parameters_from_llm is None:
-                parameters_from_llm = {}
-                logger.debug(f"Parameters for {endpoint_key} were None, defaulting to empty dict.")
-
-            if isinstance(parameters_from_llm, str):
+            for col_ref in unique_mapped_columns:
                 try:
-                    parameters_from_llm = json.loads(parameters_from_llm)
-                    if parameters_from_llm is None:
-                        parameters_from_llm = {}
-                    logger.debug(f"Parsed parameters string for {endpoint_key}: {parameters_from_llm}")
-                except json.JSONDecodeError:
-                    logger.error(
-                        f"LLM generated invalid JSON string for parameters: {parameters_from_llm}. Skipping parameters for this request.")
-                    parameters_from_llm = {}
-
-            # Loop through parameters to check for mapped data
-            for param_name, param_value in parameters_from_llm.items():
-                if param_value.startswith("${") and param_value.endswith("}"):
-                    # This is a JMeter variable, likely from a mapping
-                    jmeter_var_name = param_value[2:-1]  # Remove ${ and }
-                    original_mapping_format = jmeter_var_name.replace('_', '.')
-
-                    found_mapping = None
-                    for ep_key, ep_mappings in mappings.items():
-                        for map_param, map_target in ep_mappings.items():
-                            if map_target == original_mapping_format:
-                                found_mapping = map_target
-                                break
-                        if found_mapping:
-                            break
-
-                    if found_mapping:
-                        table_name, column_name = found_mapping.split('.')
-                        csv_columns.add(f"{table_name}.{column_name}")
-                        csv_data_needed = True
-                        logger.debug(f"Identified mapped parameter needing CSV data: {found_mapping}")
-                    else:
-                        logger.warning(
-                            f"JMeter variable '{jmeter_var_name}' found in LLM plan but no matching original mapping '{original_mapping_format}' in DataMapper. Skipping CSV collection for this param.")
-
-        if csv_data_needed and database_connector:
-            csv_data = {}
-            for col_identifier in csv_columns:
-                table_name, column_name = col_identifier.split('.')
-                try:
-                    df = database_connector.preview_data(table_name, limit=None)  # Fetch all data
-                    if not df.empty and column_name in df.columns:
-                        column_values = df[column_name].tolist()
-                        csv_data[col_identifier] = column_values
-                        logger.debug(f"Collected {len(column_values)} values for {col_identifier}")
-                    else:
-                        logger.warning(
-                            f"Column '{column_name}' not found or table '{table_name}' is empty for CSV data.")
+                    table_name, column_name = col_ref.split('.')
+                    if table_name in database_connector.get_tables():
+                        df = database_connector.preview_data(table_name, limit=None)
+                        if column_name in df.columns:
+                            csv_data[col_ref] = df[column_name].tolist()
+                            if col_ref not in csv_headers:
+                                csv_headers.append(col_ref)
                 except Exception as e:
-                    logger.error(f"Error fetching data for CSV for {col_identifier}: {e}")
+                    logger.warning(f"Warning: Could not fetch data for {col_ref} from DB: {e}")
 
+        # Create CSV Data Set Config if there's data to parameterize
+        if csv_headers:
+            csv_config_element = self.add_csv_data_config(
+                parent_element=thread_group_children_hash_tree,  # Added as child of ThreadGroup's hashTree
+                filename="data.csv",
+                variable_names=",".join([col.replace('.', '_') for col in csv_headers])
+            )
+            self._create_element(thread_group_children_hash_tree, "hashTree")  # SIBLING hashTree for CSVDataSet
+
+        # Generate CSV content for display
+        if csv_headers and csv_data:
+            csv_content = ",".join([col.replace('.', '_') for col in csv_headers]) + "\n"
+            max_rows = 0
             if csv_data:
-                max_rows = 0
-                if csv_data:
-                    max_rows = max(len(v) for v in csv_data.values()) if csv_data else 0
+                max_rows = max(len(v) for v in csv_data.values())
 
-                csv_header = []
-                csv_rows = []
+            for i in range(max_rows):
+                row_values = []
+                for header in csv_headers:
+                    values = csv_data.get(header, [])
+                    row_values.append(str(values[i]) if i < len(values) else "")
+                csv_content += ",".join(row_values) + "\n"
 
-                sorted_csv_columns = sorted(list(csv_data.keys()))
-                csv_header = [col.replace('.', '_') for col in
-                              sorted_csv_columns]  # JMeter variable names use underscores
+        # --- Add Homepage Request (HTTP GET to /) ---
+        homepage_sampler = self.add_http_sampler(
+            parent_element=thread_group_children_hash_tree,
+            name="Homepage Request",
+            method="GET",
+            path="/",
+            parameters={},
+            body=None
+        )
+        # SIBLING hashTree for the Homepage Request sampler
+        homepage_sampler_children_hash_tree = self._create_element(thread_group_children_hash_tree, "hashTree")
 
-                for i in range(max_rows):
-                    row_values = []
-                    for col_identifier in sorted_csv_columns:
-                        values = csv_data.get(col_identifier, [])
-                        row_values.append(str(values[i]) if i < len(values) else "")  # Handle uneven column lengths
-                    csv_rows.append(",".join(row_values))
+        # Add Assertion as a child of the sampler's sibling hashTree
+        assertion = self.add_response_assertion(homepage_sampler_children_hash_tree, "Check Status 200",
+                                                "Response Code", "Equals", "200")
+        self._create_element(homepage_sampler_children_hash_tree, "hashTree")  # SIBLING hashTree for the assertion
 
-                csv_content = ",".join(csv_header) + "\n" + "\n".join(csv_rows)
-                logger.info(f"Generated CSV content with {max_rows} rows for columns: {csv_header}")
+        # --- Add Create User Request (HTTP POST to /user) ---
+        create_user_body = '{"username": "user${__Random(1,100,)}", "email": "user${__Random(1,100,)}@example.com"}'
+        create_user_headers = {"Content-Type": "application/json"}
+        create_user_sampler = self.add_http_sampler(
+            parent_element=thread_group_children_hash_tree,
+            name="Create User",
+            method="POST",
+            path="/user",
+            parameters={},
+            body=create_user_body
+        )
+        # SIBLING hashTree for the Create User sampler
+        create_user_sampler_children_hash_tree = self._create_element(thread_group_children_hash_tree, "hashTree")
 
-                csv_variable_names = ",".join(csv_header)  # Use JMeter variable names (underscores)
-                self.add_csv_data_config(thread_group_elements, "data.csv", csv_variable_names)
-            else:
-                logger.info("No data collected for CSV config despite mapped parameters. CSV config will not be added.")
+        # Add Header Manager
+        if create_user_headers:
+            header_manager = self.add_header_manager(create_user_sampler_children_hash_tree, create_user_headers,
+                                                     name="HTTP Header Manager")
+            self._create_element(create_user_sampler_children_hash_tree,
+                                 "hashTree")  # SIBLING hashTree for HeaderManager
+
+        # Add Assertion
+        assertion = self.add_response_assertion(create_user_sampler_children_hash_tree, "Create User - Status 200",
+                                                "Response Code", "Equals", "200")
+        self._create_element(create_user_sampler_children_hash_tree, "hashTree")  # SIBLING hashTree for the assertion
+
+        # Add JSON Extractor
+        extractor = self.add_json_extractor(create_user_sampler_children_hash_tree, "Extract User ID", "$.id",
+                                            "user_id")
+        self._create_element(create_user_sampler_children_hash_tree, "hashTree")  # SIBLING hashTree for the extractor
+
+        # --- Add Login User Request (HTTP POST to /login) ---
+        login_user_body = '{"username": "user1", "password": "pass123"}'
+        login_user_headers = {"Content-Type": "application/json"}
+        login_user_sampler = self.add_http_sampler(
+            parent_element=thread_group_children_hash_tree,
+            name="Login User",
+            method="POST",
+            path="/login",
+            parameters={},
+            body=login_user_body
+        )
+        # SIBLING hashTree for the Login User sampler
+        login_user_sampler_children_hash_tree = self._create_element(thread_group_children_hash_tree, "hashTree")
+
+        # Add Header Manager
+        if login_user_headers:
+            header_manager = self.add_header_manager(login_user_sampler_children_hash_tree, login_user_headers,
+                                                     name="HTTP Header Manager")
+            self._create_element(login_user_sampler_children_hash_tree,
+                                 "hashTree")  # SIBLING hashTree for HeaderManager
+
+        # Add Assertion
+        assertion = self.add_response_assertion(login_user_sampler_children_hash_tree, "Login User - Status 200",
+                                                "Response Code", "Equals", "200")
+        self._create_element(login_user_sampler_children_hash_tree, "hashTree")  # SIBLING hashTree for the assertion
+
+        # --- Add Get Pets By Status Request ---
+        get_pets_parameters = {"status": "${pets_status}"}
+        get_pets_sampler = self.add_http_sampler(
+            parent_element=thread_group_children_hash_tree,
+            name="Get Pets By Status",
+            method="GET",
+            path="/pet/findByStatus",
+            parameters=get_pets_parameters,
+            body=None
+        )
+        # SIBLING hashTree for the Get Pets By Status sampler
+        get_pets_sampler_children_hash_tree = self._create_element(thread_group_children_hash_tree, "hashTree")
+
+        # Add Assertion
+        assertion = self.add_response_assertion(get_pets_sampler_children_hash_tree, "Get Pets By Status - Status 200",
+                                                "Response Code", "Equals", "200")
+        self._create_element(get_pets_sampler_children_hash_tree, "hashTree")  # SIBLING hashTree for the assertion
+
+        # --- Add other requests from scenario_plan (if any) ---
+        if scenario_plan is None:
+            scenario_plan = {"requests": []}
 
         for request_data in scenario_plan['requests']:
             endpoint_key = request_data['endpoint_key']
@@ -429,105 +600,44 @@ class JMeterScriptGenerator:
                 else:
                     processed_parameters[param_name] = param_value
 
-            # Call add_http_sampler and get its internal hashTree
-            current_sampler_hash_tree = self.add_http_sampler(thread_group_elements, name, method, path,
-                                                              processed_parameters, body, headers)
+            current_sampler = self.add_http_sampler(thread_group_children_hash_tree, name, method, path,
+                                                    processed_parameters, body)
+            current_sampler_children_hash_tree = self._create_element(thread_group_children_hash_tree,
+                                                                      "hashTree")  # SIBLING hashTree
 
-            # Now, add assertions and extractors as children of current_sampler_hash_tree
-            self.add_response_assertion(current_sampler_hash_tree, f"{name} - Status 200", "Response Code", "Equals",
-                                        "200")
+            # Add Header Manager if headers are present for LLM-generated requests
+            if headers:
+                header_manager = self.add_header_manager(current_sampler_children_hash_tree, headers,
+                                                         name="HTTP Header Manager")
+                self._create_element(current_sampler_children_hash_tree,
+                                     "hashTree")  # SIBLING hashTree for HeaderManager
+
+            assertion = self.add_response_assertion(current_sampler_children_hash_tree, f"{name} - Status 200",
+                                                    "Response Code", "Equals", "200")
+            self._create_element(current_sampler_children_hash_tree, "hashTree")  # SIBLING hashTree for the assertion
 
             if method == "POST" and body and isinstance(body, str) and "id" in body:
                 logger.debug(f"Adding JSON Extractor for {name} to capture 'id'.")
-                self.add_json_extractor(current_sampler_hash_tree, f"{name} - Extract ID", "$.id",
-                                        f"{name.replace(' ', '_')}_id")
+                extractor = self.add_json_extractor(current_sampler_children_hash_tree, f"{name} - Extract ID", "$.id",
+                                                    f"{name.replace(' ', '_')}_id")
+                self._create_element(current_sampler_children_hash_tree,
+                                     "hashTree")  # SIBLING hashTree for the extractor
+
+        # --- Add Listeners as per user's request ---
+        # Listeners are direct children of TestPlan's children hash tree
+        view_results_tree = self.add_view_results_tree_listener(self.test_plan_children_hash_tree)
+        self._create_element(self.test_plan_children_hash_tree, "hashTree")  # SIBLING hashTree for View Results Tree
+
+        summary_report = self.add_summary_report_listener(self.test_plan_children_hash_tree)
+        self._create_element(self.test_plan_children_hash_tree, "hashTree")  # SIBLING hashTree for Summary Report
 
         # Generate XML string
         rough_string = ET.tostring(self.test_plan_root, 'utf-8')
         reparsed = minidom.parseString(rough_string)
         pretty_jmx = reparsed.toprettyxml(indent="  ")
 
-        # JMeter JMX files often have a specific XML declaration and doctype
-        # We can add these if missing or ensure they are correct
-        final_jmx_content = f'<?xml version="1.0" encoding="UTF-8"?>\n' \
-                            f'<!DOCTYPE jmeterTestPlan SYSTEM "jmeter.apache.org/dtd/jmeter_2_3.dtd">\n' \
-                            + pretty_jmx.split('?>\n', 1)[-1]  # Remove old XML declaration if exists
+        # REMOVED: <!DOCTYPE jmeterTestPlan SYSTEM "jmeter.apache.org/dtd/jmeter_2_3.dtd">
+        # This line is removed to prevent SAXParseException due to disallow-doctype-decl.
+        final_jmx_content = pretty_jmx.split('?>\n', 1)[-1].strip()  # Remove old XML declaration and DOCTYPE if exists
 
         return final_jmx_content, csv_content
-
-    # Placeholder for JMX content generation (replace with actual JMeter XML generation)
-    def _generate_placeholder_jmx(self, endpoints, mappings, thread_group_users, ramp_up_time, loop_count) -> str:
-        # This placeholder logic is not currently used by generate_jmx, but kept for completeness
-        jmx_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.2.1">
-  <hashTree>
-    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Generated Test Plan" enabled="true">
-      <stringProp name="TestPlan.comments"></stringProp>
-      <boolProp name="TestPlan.functional_mode">false</boolProp>
-      <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
-      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
-      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
-        <collectionProp name="Arguments.arguments"/>
-      </elementProp>
-      <stringProp name="TestPlan.user_define_classpath"></stringProp>
-    </TestPlan>
-    <hashTree>
-      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Users" enabled="true">
-        <stringProp name="ThreadGroup.num_threads">{thread_group_users}</stringProp>
-        <stringProp name="ThreadGroup.ramp_time">{ramp_up_time}</stringProp>
-        <boolProp name="ThreadGroup.scheduler">false</boolProp>
-        <stringProp name="ThreadGroup.duration"></stringProp>
-        <stringProp name="ThreadGroup.delay"></stringProp>
-        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
-        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller" enabled="true">
-          <boolProp name="LoopController.continue_forever">false</boolProp>
-          <stringProp name="LoopController.loops">{loop_count}</stringProp>
-        </elementProp>
-      </ThreadGroup>
-      <hashTree>
-        <!-- HTTP Request Defaults -->
-        <ConfigTestElement guiclass="HttpDefaultsGui" testclass="HttpDefaults" testname="HTTP Request Defaults" enabled="true">
-          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
-            <collectionProp name="Arguments.arguments"/>
-          </elementProp>
-          <stringProp name="HTTPSampler.domain">petstore.swagger.io</stringProp>
-          <stringProp name="HTTPSampler.protocol">https</stringProp>
-          <stringProp name="HTTPSampler.contentEncoding"></stringProp>
-          <stringProp name="HTTPSampler.port"></stringProp>
-          <stringProp name="HTTPSampler.proxyHost"></stringProp>
-          <stringProp name="HTTPSampler.proxyPort"></stringProp>
-          <stringProp name="HTTPSampler.proxyUser"></stringProp>
-          <stringProp name="HTTPSampler.proxyPass"></stringProp>
-          <boolProp name="HTTPSampler.send_chunked_post_body">false</boolProp>
-          <stringProp name="HTTPSampler.connection_timeout"></stringProp>
-          <stringProp name="HTTPSampler.response_timeout"></stringProp>
-        </ConfigTestElement>
-        <hashTree/>
-        <!-- Samplers based on Endpoints -->
-"""
-        for endpoint in endpoints:
-            # Simple placeholder for each endpoint
-            jmx_content += f"""
-        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="{endpoint.method} {endpoint.path}" enabled="true">
-          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="User Defined Variables" enabled="true">
-            <collectionProp name="Arguments.arguments"/>
-          </elementProp>
-          <stringProp name="HTTPSampler.method">{endpoint.method}</stringProp>
-          <stringProp name="HTTPSampler.path">{endpoint.path}</stringProp>
-          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
-          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
-          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
-          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
-          <elementProp name="HTTPSampler.HeaderTemplate" elementType="HeaderPanel" guiclass="HeaderPanel" testclass="HeaderPanel" testname="Headers" enabled="true">
-            <collectionProp name="Header.headers"/>
-          </elementProp>
-        </HTTPSamplerProxy>
-        <hashTree/>
-"""
-
-        jmx_content += """
-      </hashTree>
-    </hashTree>
-</jmeterTestPlan>
-"""
-        return jmx_content
