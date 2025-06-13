@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 class JMeterScriptGenerator:
-    def __init__(self):
+    def __init__(self, test_plan_name: str = "Web Application Performance Test",
+                 thread_group_name: str = "Users"):
         # Initialize the root of the JMeter Test Plan XML structure
         self.test_plan_root = ET.Element("jmeterTestPlan", version="1.2", properties="5.0", jmeter="5.6.3")
 
@@ -23,7 +24,7 @@ class JMeterScriptGenerator:
         self.test_plan = self._create_element(self.root_hash_tree_container, "TestPlan", attrib={
             "guiclass": "TestPlanGui",
             "testclass": "TestPlan",
-            "testname": "Web Application Performance Test",
+            "testname": test_plan_name,  # Use provided test plan name
             "enabled": "true"
         })
         self._create_string_prop(self.test_plan, "TestPlan.comments",
@@ -49,6 +50,7 @@ class JMeterScriptGenerator:
         self.test_plan_global_hashtree = self._create_element(self.root_hash_tree_container, "hashTree")
 
         self.csv_config = None  # Placeholder for CSV config
+        self.thread_group_name = thread_group_name  # Store thread group name
 
     def _create_element(self, parent: ET.Element, tag: str, attrib: Optional[Dict[str, str]] = None) -> ET.Element:
         """Helper to create an XML SubElement."""
@@ -71,6 +73,12 @@ class JMeterScriptGenerator:
         """Helper to create a <boolProp> element."""
         prop = self._create_element(parent, "boolProp", {"name": name})
         prop.text = "true" if value else "false"
+        return prop
+
+    def _create_int_prop(self, parent: ET.Element, name: str, value: int) -> ET.Element:
+        """Helper to create an <intProp> element."""
+        prop = self._create_element(parent, "intProp", {"name": name})
+        prop.text = str(value)
         return prop
 
     def add_http_request_defaults(self, parent: ET.Element, protocol: str = "https", domain: str = "example.com",
@@ -110,7 +118,6 @@ class JMeterScriptGenerator:
         self._create_bool_prop(config, "HTTPSampler.use_keepalive", True)
         self._create_bool_prop(config, "HTTPSampler.DO_MULTIPART_POST", False)
         self._create_bool_prop(config, "HTTPSampler.BROWSER_COMPATIBLE_MULTIPART", True)
-        self._create_bool_prop(config, "HTTPSampler.concurrentDwn", False)
 
         return config
 
@@ -121,7 +128,7 @@ class JMeterScriptGenerator:
         thread_group = self._create_element(parent_element, "ThreadGroup", attrib={
             "guiclass": "ThreadGroupGui",
             "testclass": "ThreadGroup",
-            "testname": "Users",
+            "testname": self.thread_group_name,  # Use provided test plan name
             "enabled": "true"
         })
         self._create_string_prop(thread_group, "ThreadGroup.on_sample_error", "continue")
@@ -255,15 +262,19 @@ class JMeterScriptGenerator:
             "enabled": "true"
         })
 
-        test_strings_prop = self._create_collection_prop(assertion, "Assertion.test_strings")
+        # CORRECTED: Use "Asserion.test_strings" as per user's specific feedback for JMeter compatibility.
+        test_strings_prop = self._create_collection_prop(assertion, "Asserion.test_strings")
+        # As per JMeter's default behavior, the name attribute often matches the pattern here.
         str_prop = self._create_element(test_strings_prop, "stringProp", attrib={"name": pattern})
         str_prop.text = pattern
 
         self._create_string_prop(assertion, "Assertion.custom_message", "")
         self._create_string_prop(assertion, "Assertion.test_field", response_field)
-        self._create_string_prop(assertion, "Assertion.test_type", test_type)
+        self._create_int_prop(assertion, "Assertion.test_type", int(test_type))  # Changed to intProp
         self._create_bool_prop(assertion, "Assertion.assume_success", False)
-        self._create_string_prop(assertion, "Assertion.scope", "variable")
+        # Removed Assertion.scope (defaults to 'Main sample and sub-samples' when omitted)
+        # Removed Assertion.pattern_mode (defaults to 'Substring'/'Equals' when omitted)
+
         self._create_bool_prop(assertion, "Assertion.override_existing_properties", False)
 
         return assertion
@@ -304,7 +315,7 @@ class JMeterScriptGenerator:
             self._create_string_prop(header_element, "Header.name", header_name)
             self._create_string_prop(header_element, "Header.value", header_value)
 
-        return header_manager
+        return header_element
 
     def add_cookie_manager(self, parent_element: ET.Element, name: str = "HTTP Cookie Manager") -> ET.Element:
         """Adds an HTTP Cookie Manager element."""
@@ -407,6 +418,8 @@ class JMeterScriptGenerator:
 
     def generate_jmx(self, app_base_url: str, thread_group_users: int, ramp_up_time: int, loop_count: int,
                      scenario_plan: Dict[str, List[Dict[str, Any]]],
+                     test_plan_name: str,  # Added parameter
+                     thread_group_name: str,  # Added parameter
                      csv_data: Optional[str] = None,
                      global_constant_timer_delay: int = 0,
                      database_connector: Any = None,
@@ -415,7 +428,8 @@ class JMeterScriptGenerator:
         Generates a JMeter JMX script based on the provided parameters and scenario plan.
         """
 
-        self.__init__()  # Re-initialize the basic tree structure for a fresh generation
+        # Pass custom names to __init__
+        self.__init__(test_plan_name=test_plan_name, thread_group_name=thread_group_name)
 
         # 1. Add HTTP Request Defaults
         http_defaults = self.add_http_request_defaults(
@@ -518,7 +532,7 @@ class JMeterScriptGenerator:
             path = request_data.get('path', '/')
             parameters = request_data.get('parameters', {})
             body = request_data.get('body')
-            headers = request_data.get('headers', {})
+            headers = request_data.get('headers', {})  # Get headers from scenario plan
             assertions = request_data.get('assertions', [])
             json_extractors = request_data.get('json_extractors', [])
 

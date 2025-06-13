@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import os
 import sys
 import re  # Import regex module
-from urllib.parse import urlparse  # Import urlparse for parsing base URL
+from urllib.parse import urlparse # Import urlparse for parsing base URL
 
 # FIX: Increase the string conversion limit for large integers.
 sys.set_int_max_str_digits(0)  # 0 means unlimited
@@ -19,6 +19,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
 
 # Assuming these are available and correct from the 'utils' directory
 from utils.jmeter_generator import JMeterScriptGenerator
+
 
 # Configure logging to DEBUG level for detailed output
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,6 +46,7 @@ class SwaggerEndpoint:
     summary: Optional[str] = None
     operation_id: Optional[str] = None
     produces: List[str] = field(default_factory=list)
+    consumes: List[str] = field(default_factory=list) # Added consumes to capture content types
     request_body: Optional[Dict[str, Any]] = None
 
 
@@ -62,7 +64,7 @@ class SwaggerParser:
             response = requests.get(self.swagger_url, timeout=10)
             response.raise_for_status()
             self.swagger_spec = response.json()
-            self.swagger_data = self.swagger_spec  # Store fetched data
+            self.swagger_data = self.swagger_spec # Store fetched data
             return self.swagger_spec
         except Exception as e:
             logger.error(f"Failed to fetch Swagger spec: {e}")
@@ -84,12 +86,13 @@ class SwaggerParser:
                     summary = method_data.get('summary')
                     operation_id = method_data.get('operationId')
                     produces = method_data.get('produces', [])
+                    consumes = method_data.get('consumes', []) # Extract consumes
 
                     request_body_schema = None
                     for param in parameters:
                         if param.get('in') == 'body' and 'schema' in param:
                             request_body_schema = param['schema']
-                            break  # Assume only one body parameter
+                            break # Assume only one body parameter
 
                     endpoints.append(SwaggerEndpoint(
                         path=path,
@@ -99,6 +102,7 @@ class SwaggerParser:
                         summary=summary,
                         operation_id=operation_id,
                         produces=produces,
+                        consumes=consumes, # Pass consumes to SwaggerEndpoint
                         request_body=request_body_schema
                     ))
 
@@ -259,8 +263,11 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
     for ep in swagger_endpoints:
         params_summary = ", ".join([p.get('name', '') for p in ep.parameters])
         headers_summary = " (No specific headers)"
-        if ep.method == "POST" or ep.method == "PUT":
-            headers_summary = " (Common headers: Content-Type: application/json)"
+        if ep.method == "POST" or ep.method == "PUT" or ep.method == "PATCH":
+            if ep.consumes:
+                headers_summary = f" (Common headers: Content-Type: {ep.consumes[0]})"
+            else:
+                headers_summary = " (Common headers: Content-Type: application/json)"
         swagger_summary.append(f"{ep.method} {ep.path} (Parameters: {params_summary}){headers_summary}")
 
     db_schema_summary = {}
@@ -377,9 +384,20 @@ def main():
     if 'enable_constant_timer' not in st.session_state:
         st.session_state.enable_constant_timer = False
     if 'constant_timer_delay_ms' not in st.session_state:
-        st.session_state.constant_timer_delay_ms = 300  # Default to 300 ms
+        st.session_state.constant_timer_delay_ms = 300 # Default to 300 ms
     if 'include_scenario_assertions' not in st.session_state:
-        st.session_state.include_scenario_assertions = True
+        st.session_state.include_scenario_assertions = True # Default to True
+    if 'test_plan_name' not in st.session_state:
+        st.session_state.test_plan_name = "Web Application Performance Test" # Default
+    if 'thread_group_name' not in st.session_state:
+        st.session_state.thread_group_name = "Users" # Default
+    if 'select_all_endpoints' not in st.session_state:
+        st.session_state.select_all_endpoints = False # New: for select all checkbox
+    if 'jmx_content_download' not in st.session_state: # New: for persistent download
+        st.session_state.jmx_content_download = None
+    if 'csv_content_download' not in st.session_state: # New: for persistent download
+        st.session_state.csv_content_download = None
+
 
     # Create three columns for the main inputs
     col1, col2, col3 = st.columns(3)
@@ -395,24 +413,28 @@ def main():
         logger.debug(f"Swagger URL after cleaning: {repr(swagger_url)}")
 
         if st.button("Fetch Swagger", key="fetch_swagger") or \
-                (
-                        swagger_url and swagger_url != st.session_state.current_swagger_url and not st.session_state.swagger_endpoints):
+           (swagger_url and swagger_url != st.session_state.current_swagger_url and not st.session_state.swagger_endpoints):
             if swagger_url:
                 with st.spinner("Fetching Swagger specification..."):
                     try:
                         parser = SwaggerParser(swagger_url)
                         endpoints = parser.extract_endpoints()
                         st.session_state.swagger_endpoints = endpoints
-                        st.session_state.swagger_parser = parser  # Store the parser instance to access swagger_data
+                        st.session_state.swagger_parser = parser # Store the parser instance to access swagger_data
                         st.session_state.current_swagger_url = swagger_url
                         st.session_state.selected_endpoint_keys = []
                         st.session_state.scenario_requests_configs = []
+                        # Clear previous download content on new fetch
+                        st.session_state.jmx_content_download = None
+                        st.session_state.csv_content_download = None
                         st.success(f"Found {len(endpoints)} API endpoints.")
                     except Exception as e:
                         st.error(f"Failed to fetch Swagger: {str(e)}")
                         st.session_state.swagger_endpoints = []
                         st.session_state.selected_endpoint_keys = []
                         st.session_state.scenario_requests_configs = []
+                        st.session_state.jmx_content_download = None
+                        st.session_state.csv_content_download = None
             else:
                 st.warning("Please enter a Swagger JSON URL.")
 
@@ -449,52 +471,28 @@ def main():
                         conn = sqlite3.connect(db_file)
                         cursor = conn.cursor()
                         cursor.execute("""
-                                       CREATE TABLE IF NOT EXISTS pets
-                                       (
-                                           id
-                                           INTEGER
-                                           PRIMARY
-                                           KEY,
-                                           name
-                                           TEXT
-                                           NOT
-                                           NULL,
-                                           status
-                                           TEXT
-                                           NOT
-                                           NULL,
-                                           tags
-                                           TEXT
-                                       );
-                                       """)
+                            CREATE TABLE IF NOT EXISTS pets (
+                                id INTEGER PRIMARY KEY,
+                                name TEXT NOT NULL,
+                                status TEXT NOT NULL,
+                                tags TEXT
+                            );
+                        """)
                         cursor.execute("""
-                                       CREATE TABLE IF NOT EXISTS users
-                                       (
-                                           id
-                                           INTEGER
-                                           PRIMARY
-                                           KEY,
-                                           username
-                                           TEXT
-                                           NOT
-                                           NULL,
-                                           password
-                                           TEXT
-                                           NOT
-                                           NULL,
-                                           email
-                                           TEXT
-                                       );
-                                       """)
-                        cursor.execute(
-                            "INSERT INTO pets (name, status, tags) VALUES ('Buddy', 'available', 'dog,friendly');")
+                            CREATE TABLE IF NOT EXISTS users (
+                                id INTEGER PRIMARY KEY,
+                                username TEXT NOT NULL,
+                                password TEXT NOT NULL,
+                                email TEXT
+                            );
+                        """)
+                        cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Buddy', 'available', 'dog,friendly');")
                         cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Whiskers', 'pending', 'cat');")
-                        cursor.execute(
-                            "INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
+                        cursor.execute("INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
                         conn.commit()
                         conn.close()
                         st.success(f"Dummy SQLite database created at {db_file} with sample data.")
-                        st.rerun()  # Replaced st.experimental_rerun()
+                        st.rerun()
                     except Exception as ex:
                         st.error(f"Error creating dummy DB: {ex}")
             else:
@@ -511,11 +509,16 @@ def main():
                                 tables_schema[table] = schema
                             st.session_state.db_tables_schema = tables_schema
                             st.success(f"Connected! Found {len(tables)} tables")
+                            # Clear previous download content on new DB connect
+                            st.session_state.jmx_content_download = None
+                            st.session_state.csv_content_download = None
                         else:
                             st.error("Failed to connect to database")
                     except Exception as e:
                         st.error(f"Database connection error: {str(e)}")
                         st.session_state.db_tables = []
+                        st.session_state.jmx_content_download = None
+                        st.session_state.csv_content_download = None
 
         if st.session_state.db_tables:
             st.subheader("Database Tables")
@@ -572,10 +575,25 @@ def main():
             st.markdown(st.session_state.llm_suggestion)
             st.info("Use this as a guide to configure your scenario below.")
 
+
     st.header("2. Load Profile Configuration")
     col1, col2, col3 = st.columns(3)
 
     with col1:
+        st.session_state.test_plan_name = st.text_input(
+            "Test Plan Name",
+            value=st.session_state.test_plan_name,
+            key="test_plan_name_input",
+            help="Name for the overall JMeter Test Plan."
+        )
+    with col2:
+        st.session_state.thread_group_name = st.text_input(
+            "Thread Group Name",
+            value=st.session_state.thread_group_name,
+            key="thread_group_name_input",
+            help="Name for the main Thread Group (Users)."
+        )
+    with col3:
         num_users = st.number_input(
             "Number of Concurrent Users (Threads)",
             min_value=1,
@@ -583,7 +601,8 @@ def main():
             step=1,
             key="num_users_input"
         )
-    with col2:
+    col4, col5 = st.columns(2)
+    with col4:
         ramp_up_time = st.number_input(
             "Ramp-up Time (seconds)",
             min_value=0,
@@ -591,7 +610,7 @@ def main():
             step=5,
             key="ramp_up_time_input"
         )
-    with col3:
+    with col5:
         loop_count_option = st.selectbox(
             "Loop Count",
             options=["Infinite", "Specify iterations"],
@@ -632,24 +651,37 @@ def main():
 
     with col_assertion:
         st.session_state.include_scenario_assertions = st.checkbox(
-            "Include Response Assertions in Scenario",
+            "Include Response Assertions in Scenario (Status 200)",
             value=st.session_state.include_scenario_assertions,
             key="include_scenario_assertions_checkbox",
-            help="If unchecked, no assertion configuration fields will be shown or generated for any request. A default 'Response Code 200' will be added if enabled."
+            help="If checked, a 'Response Code 200' assertion will be added to each request in the scenario."
         )
+
 
     st.header("3. Select Endpoints for Scenario")
     if st.session_state.swagger_endpoints:
         endpoint_options = [f"{ep.method} {ep.path}" for ep in st.session_state.swagger_endpoints]
 
+        # New: Select All Endpoints checkbox
+        select_all_toggle = st.checkbox("Select All Endpoints", key="select_all_endpoints_checkbox")
+
+        # Determine default selection based on toggle
+        default_selected_endpoints = []
+        if select_all_toggle:
+            default_selected_endpoints = endpoint_options
+        else:
+            default_selected_endpoints = st.session_state.selected_endpoint_keys
+
+
         selected_endpoint_keys = st.multiselect(
             "Select API Endpoints for your scenario (order reflects execution sequence)",
             options=endpoint_options,
-            default=st.session_state.selected_endpoint_keys,
+            default=default_selected_endpoints, # Use the dynamic default
             key="endpoint_selector"
         )
 
-        if selected_endpoint_keys != st.session_state.selected_endpoint_keys:
+        # Update session state if multiselect value changes or select all is toggled
+        if selected_endpoint_keys != st.session_state.selected_endpoint_keys: # This check is important
             st.session_state.selected_endpoint_keys = selected_endpoint_keys
             new_scenario_configs = []
 
@@ -662,13 +694,19 @@ def main():
                                                                         tables_schema_for_mapping)
 
             for ep_key in selected_endpoint_keys:
-                current_endpoint = next(
-                    (ep for ep in st.session_state.swagger_endpoints if f"{ep.method} {ep.path}" == ep_key), None)
+                current_endpoint = next((ep for ep in st.session_state.swagger_endpoints if f"{ep.method} {ep.path}" == ep_key), None)
 
                 if current_endpoint:
+                    # New Naming Convention
+                    clean_path_name = re.sub(r'[^\w\s-]', '', current_endpoint.path).replace('/', '_').strip('_')
+                    if current_endpoint.operation_id:
+                        request_name = f"{current_endpoint.method}_{current_endpoint.operation_id}"
+                    else:
+                        request_name = f"{current_endpoint.method}_{clean_path_name}"
+
                     request_config = {
                         "endpoint_key": ep_key,
-                        "name": f"{current_endpoint.method} {current_endpoint.path.replace('/', '_')}",
+                        "name": request_name, # Use new naming convention
                         "method": current_endpoint.method,
                         "path": current_endpoint.path,
                         "parameters": {},
@@ -695,8 +733,14 @@ def main():
                                     else:
                                         request_config['parameters'][param['name']] = f"dummy_{param['name']}"
 
+
                     if current_endpoint.method in ["POST", "PUT", "PATCH"]:
-                        request_config["headers"] = {"Content-Type": "application/json"}
+                        # Set Content-Type based on Swagger 'consumes' or default
+                        content_type_header = "application/json" # Default
+                        if current_endpoint.consumes:
+                            content_type_header = current_endpoint.consumes[0] # Take the first one
+                        request_config["headers"]["Content-Type"] = content_type_header
+
                         if current_endpoint.request_body and st.session_state.get('swagger_parser'):
                             try:
                                 def resolve_ref(schema_obj, definitions):
@@ -704,7 +748,6 @@ def main():
                                         ref_path = schema_obj['$ref'].split('/')
                                         definition_name = ref_path[-1]
                                         return definitions.get(definition_name, {})
-                                    return schema_obj
 
                                 definitions = st.session_state.swagger_parser.swagger_data.get('definitions', {})
                                 resolved_schema = resolve_ref(current_endpoint.request_body, definitions)
@@ -736,13 +779,13 @@ def main():
                     new_scenario_configs.append(request_config)
 
             st.session_state.scenario_requests_configs = new_scenario_configs
-            st.rerun()  # Replaced st.experimental_rerun()
+            st.rerun() # Rerun to update the displayed configurations
 
         st.markdown("---")
         st.subheader("Selected Endpoints (Auto-Configured)")
         if st.session_state.scenario_requests_configs:
             for i, config in enumerate(st.session_state.scenario_requests_configs):
-                st.code(f"Request {i + 1}: {config['method']} {config['path']}")
+                st.code(f"Request {i+1}: {config['method']} {config['path']} (Name: {config['name']})") # Show new name
                 with st.expander(f"View Auto-Configuration for {config['name']}"):
                     st.json(config)
         else:
@@ -750,6 +793,7 @@ def main():
 
     else:
         st.info("Please fetch a Swagger file to build your test scenario.")
+
 
     st.markdown("---")
 
@@ -772,52 +816,63 @@ def main():
 
             global_constant_timer_delay = st.session_state.constant_timer_delay_ms if st.session_state.enable_constant_timer else 0
 
-            generator = JMeterScriptGenerator()
+
+            generator = JMeterScriptGenerator(
+                test_plan_name=st.session_state.test_plan_name,
+                thread_group_name=st.session_state.thread_group_name
+            )
             jmx_content, csv_content = generator.generate_jmx(
-                app_base_url=swagger_url,
+                app_base_url=swagger_url, # Use the cleaned swagger_url as base URL
                 thread_group_users=num_users,
                 ramp_up_time=ramp_up_time,
                 loop_count=loop_count,
                 scenario_plan=scenario_plan,
-                csv_data=None,
-                global_constant_timer_delay=global_constant_timer_delay
+                database_connector=st.session_state.db_connector, # Pass database connector
+                db_tables_schema=st.session_state.db_tables_schema, # Pass DB tables schema
+                global_constant_timer_delay=global_constant_timer_delay,
+                test_plan_name=st.session_state.test_plan_name, # Passed explicitly
+                thread_group_name=st.session_state.thread_group_name # Passed explicitly
             )
+
+            st.session_state.jmx_content_download = jmx_content # Store for persistence
+            st.session_state.csv_content_download = csv_content # Store for persistence
 
             st.success("JMeter script generated successfully!")
-
-            st.subheader("Generated JMeter Test Plan (.jmx)")
-            st.code(jmx_content, language="xml")
-
-            st.download_button(
-                label="Download JMX File",
-                data=jmx_content.encode("utf-8"),
-                file_name="generated_test_plan.jmx",
-                mime="application/xml",
-                key="download_jmx_final"
-            )
-
-            if csv_content:
-                st.subheader("Generated CSV Data (data.csv)")
-                st.code(csv_content, language="csv")
-                st.download_button(
-                    label="Download CSV File",
-                    data=csv_content.encode("utf-8"),
-                    file_name="data.csv",
-                    mime="text/csv",
-                    key="download_csv_final"
-                )
-            else:
-                st.info("No CSV data was generated for this test plan.")
 
         except Exception as e:
             st.error(f"An error occurred during script generation: {e}")
             logger.error(f"Error in main app execution: {e}", exc_info=True)
 
+    # --- Download Links (Rendered Persistently) ---
+    st.subheader("Download Generated Files")
+    if st.session_state.jmx_content_download:
+        st.download_button(
+            label="Download JMeter Test Plan (.jmx)",
+            data=st.session_state.jmx_content_download.encode("utf-8"),
+            file_name="generated_test_plan.jmx",
+            mime="application/xml",
+            key="download_jmx_final"
+        )
+
+    if st.session_state.csv_content_download:
+        st.download_button(
+            label="Download CSV Data (data.csv)",
+            data=st.session_state.csv_content_download.encode("utf-8"),
+            file_name="data.csv",
+            mime="text/csv",
+            key="download_csv_final"
+        )
+    elif st.session_state.jmx_content_download: # Only show info if JMX is generated but CSV is not
+        st.info("No CSV data was generated for this test plan.")
+    else:
+        st.info("Generate the JMeter script above to enable download links.")
+
+
     st.markdown("---")
     st.markdown("Developed with ❤️ by Your AI Assistant")
 
-
 if __name__ == "__main__":
+    # Ensure dummy swagger.json and petstore.db exist for initial run
     if not os.path.exists("swagger.json"):
         dummy_swagger_content = """
 {
@@ -866,10 +921,43 @@ if __name__ == "__main__":
         }
       }
     },
+    "/pet": {
+      "post": {
+        "summary": "Add a new pet to the store",
+        "operationId": "addPet",
+        "consumes": [
+          "application/json",
+          "application/xml"
+        ],
+        "produces": [
+          "application/xml",
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "description": "Pet object that needs to be added to the store",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Pet"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation"
+          }
+        }
+      }
+    },
     "/user": {
       "post": {
         "summary": "Create user",
         "operationId": "createUser",
+        "consumes": [
+          "application/json"
+        ],
         "produces": [
           "application/xml",
           "application/json"
@@ -892,8 +980,8 @@ if __name__ == "__main__":
         }
       }
     },
-    "/login": {
-      "post": {
+    "/user/login": {
+      "get": {
         "summary": "Logs user into the system",
         "operationId": "loginUser",
         "produces": [
@@ -922,6 +1010,90 @@ if __name__ == "__main__":
           }
         }
       }
+    },
+    "/user/{username}": {
+      "get": {
+        "summary": "Get user by user name",
+        "operationId": "getUserByName",
+        "produces": [
+          "application/xml",
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "description": "The name that needs to be fetched. Use user1 for testing.",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation"
+          }
+        }
+      }
+    },
+    "/user/{username}": {
+      "put": {
+        "summary": "Updated user",
+        "operationId": "updateUser",
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/xml",
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "description": "name that need to be updated",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "in": "body",
+            "name": "body",
+            "description": "Updated user object",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/User"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation"
+          }
+        }
+      }
+    },
+    "/user/{username}": {
+      "delete": {
+        "summary": "Delete user",
+        "operationId": "deleteUser",
+        "produces": [
+          "application/xml",
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "description": "The name that needs to be deleted",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation"
+          }
+        }
+      }
     }
   },
   "definitions": {
@@ -939,6 +1111,84 @@ if __name__ == "__main__":
           "type": "string"
         }
       }
+    },
+    "Pet": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "category": {
+          "$ref": "#/definitions/Category"
+        },
+        "name": {
+          "type": "string",
+          "example": "doggie"
+        },
+        "photoUrls": {
+          "type": "array",
+          "xml": {
+            "name": "photoUrl",
+            "wrapped": true
+          },
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "xml": {
+            "name": "tag",
+            "wrapped": true
+          },
+          "items": {
+            "$ref": "#/definitions/Tag"
+          }
+        },
+        "status": {
+          "type": "string",
+          "description": "pet status in the store",
+          "enum": [
+            "available",
+            "pending",
+            "sold"
+          ]
+        }
+      },
+      "xml": {
+        "name": "Pet"
+      }
+    },
+    "Category": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "xml": {
+        "name": "Category"
+      }
+    },
+    "Tag": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "xml": {
+        "name": "Tag"
+      }
     }
   }
 }
@@ -954,51 +1204,29 @@ if __name__ == "__main__":
             conn = sqlite3.connect(dummy_db_path)
             cursor = conn.cursor()
             cursor.execute("""
-                           CREATE TABLE IF NOT EXISTS pets
-                           (
-                               id
-                               INTEGER
-                               PRIMARY
-                               KEY,
-                               name
-                               TEXT
-                               NOT
-                               NULL,
-                               status
-                               TEXT
-                               NOT
-                               NULL,
-                               tags
-                               TEXT
-                           );
-                           """)
+                CREATE TABLE IF NOT EXISTS pets (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    tags TEXT
+                );
+            """)
             cursor.execute("""
-                           CREATE TABLE IF NOT EXISTS users
-                           (
-                               id
-                               INTEGER
-                               PRIMARY
-                               KEY,
-                               username
-                               TEXT
-                               NOT
-                               NULL,
-                               password
-                               TEXT
-                               NOT
-                               NULL,
-                               email
-                               TEXT
-                           );
-                           """)
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    email TEXT
+                );
+            """)
             cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Buddy', 'available', 'dog,friendly');")
             cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Whiskers', 'pending', 'cat');")
-            cursor.execute(
-                "INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
+            cursor.execute("INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
             conn.commit()
             conn.close()
             logger.info(f"Dummy SQLite database created at {dummy_db_path} with sample data.")
         except Exception as ex:
             logger.error(f"Error creating dummy DB during __main__ init: {ex}")
+
 
     main()
