@@ -5,11 +5,13 @@ import sqlite3
 import pandas as pd
 from typing import Dict, List, Any, Optional
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field  # Keep dataclass and field for other @dataclass uses
 import os
 import sys
 import re  # Import regex module
-from urllib.parse import urlparse # Import urlparse for parsing base URL
+from urllib.parse import urlparse  # Import urlparse for parsing base URL
+import uuid  # For UUID generation
+import time  # For timestamp generation
 
 # FIX: Increase the string conversion limit for large integers.
 sys.set_int_max_str_digits(0)  # 0 means unlimited
@@ -19,202 +21,17 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
 
 # Assuming these are available and correct from the 'utils' directory
 from utils.jmeter_generator import JMeterScriptGenerator
-
+from utils.database_connector import DatabaseConnector, DatabaseConfig
+from utils.swagger_parser import SwaggerParser, SwaggerEndpoint  # IMPORT from utils
+from utils.data_mapper import DataMapper  # Import DataMapper
 
 # Configure logging to DEBUG level for detailed output
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DatabaseConfig:
-    db_type: str
-    host: str = ""
-    port: int = 0
-    username: str = ""
-    password: str = ""
-    database: str = ""
-    file_path: str = ""  # For SQLite
-
-
-@dataclass
-class SwaggerEndpoint:
-    path: str
-    method: str
-    parameters: List[Dict[str, Any]]
-    responses: Dict[str, Any]
-    summary: Optional[str] = None
-    operation_id: Optional[str] = None
-    produces: List[str] = field(default_factory=list)
-    consumes: List[str] = field(default_factory=list) # Added consumes to capture content types
-    request_body: Optional[Dict[str, Any]] = None
-
-
-class SwaggerParser:
-    """Parse Swagger/OpenAPI specifications"""
-
-    def __init__(self, swagger_url: str):
-        self.swagger_url = swagger_url
-        self.swagger_spec = None
-        self.swagger_data = {}
-
-    def fetch_swagger_spec(self) -> Dict[str, Any]:
-        """Fetch and parse Swagger specification"""
-        try:
-            response = requests.get(self.swagger_url, timeout=10)
-            response.raise_for_status()
-            self.swagger_spec = response.json()
-            self.swagger_data = self.swagger_spec # Store fetched data
-            return self.swagger_spec
-        except Exception as e:
-            logger.error(f"Failed to fetch Swagger spec: {e}")
-            raise
-
-    def extract_endpoints(self) -> List[SwaggerEndpoint]:
-        """Extract API endpoints from Swagger spec"""
-        if not self.swagger_spec:
-            self.fetch_swagger_spec()
-
-        endpoints = []
-        paths = self.swagger_spec.get('paths', {})
-
-        for path, path_data in paths.items():
-            for method, method_data in path_data.items():
-                if method.upper() in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']:
-                    parameters = method_data.get('parameters', [])
-                    responses = method_data.get('responses', {})
-                    summary = method_data.get('summary')
-                    operation_id = method_data.get('operationId')
-                    produces = method_data.get('produces', [])
-                    consumes = method_data.get('consumes', []) # Extract consumes
-
-                    request_body_schema = None
-                    for param in parameters:
-                        if param.get('in') == 'body' and 'schema' in param:
-                            request_body_schema = param['schema']
-                            break # Assume only one body parameter
-
-                    endpoints.append(SwaggerEndpoint(
-                        path=path,
-                        method=method.upper(),
-                        parameters=parameters,
-                        responses=responses,
-                        summary=summary,
-                        operation_id=operation_id,
-                        produces=produces,
-                        consumes=consumes, # Pass consumes to SwaggerEndpoint
-                        request_body=request_body_schema
-                    ))
-
-        return endpoints
-
-
-class DatabaseConnector:
-    """Handle database connections and queries"""
-
-    def __init__(self, config: DatabaseConfig):
-        self.config = config
-        self.connection = None
-
-    def connect(self):
-        """Establish database connection"""
-        try:
-            if self.config.db_type.lower() == 'sqlite':
-                # Use check_same_thread=False for Streamlit's multi-threading environment
-                self.connection = sqlite3.connect(self.config.file_path, check_same_thread=False)
-            # Add other database types as needed
-            return True
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            return False
-
-    def get_tables(self) -> List[str]:
-        """Get list of tables in the database"""
-        if not self.connection:
-            return []
-
-        try:
-            if self.config.db_type.lower() == 'sqlite':
-                cursor = self.connection.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                tables = [row[0] for row in cursor.fetchall()]
-                return tables
-        except Exception as e:
-            logger.error(f"Failed to get tables: {e}")
-            return []
-
-    def get_table_schema(self, table_name: str) -> List[Dict[str, str]]:
-        """Get schema information for a table"""
-        if not self.connection:
-            return []
-
-        try:
-            if self.config.db_type.lower() == 'sqlite':
-                cursor = self.connection.cursor()
-                cursor.execute(f"PRAGMA table_info({table_name});")
-                columns = cursor.fetchall()
-                return [{'name': col[1], 'type': col[2]} for col in columns]
-        except Exception as e:
-            logger.error(f"Failed to get table schema: {e}")
-            return []
-
-    def preview_data(self, table_name: str, limit: int = 5) -> pd.DataFrame:
-        """Preview data from a table"""
-        if not self.connection:
-            return pd.DataFrame()
-
-        try:
-            query = f"SELECT * FROM {table_name}"
-            if limit is not None:
-                query += f" LIMIT {limit}"
-            return pd.read_sql_query(query, self.connection)
-        except Exception as e:
-            logger.error(f"Failed to preview data: {e}")
-            return pd.DataFrame()
-
-
-class DataMapper:
-    """Map database fields to API parameters using AI suggestions"""
-
-    @staticmethod
-    def suggest_mappings(endpoints: List[SwaggerEndpoint], tables_schema: Dict[str, List[Dict[str, str]]]) -> Dict[
-        str, Dict[str, str]]:
-        """Suggest mappings between API parameters and database fields"""
-        mappings = {}
-
-        for endpoint in endpoints:
-            endpoint_key = f"{endpoint.method} {endpoint.path}"
-            mappings[endpoint_key] = {}
-
-            for param in endpoint.parameters:
-                param_name = param.get('name', '')
-                param_type = param.get('type', param.get('schema', {}).get('type', ''))
-
-                best_match = DataMapper._find_best_match(param_name, param_type, tables_schema)
-                if best_match:
-                    mappings[endpoint_key][param_name] = best_match
-
-        return mappings
-
-    @staticmethod
-    def _find_best_match(param_name: str, param_type: str, tables_schema: Dict[str, List[Dict[str, str]]]) -> str:
-        """Find best matching database field for a parameter"""
-        # Simple matching logic - can be enhanced with ML/AI
-        param_name_lower = param_name.lower()
-
-        for table_name, columns in tables_schema.items():
-            for column in columns:
-                column_name = column['name'].lower()
-
-                # Exact match
-                if param_name_lower == column_name:
-                    return f"{table_name}.{column['name']}"
-
-                # Partial match
-                if param_name_lower in column_name or column_name in param_name_lower:
-                    return f"{table_name}.{column['name']}"
-
-        return ""
+# SwaggerEndpoint and SwaggerParser classes are now imported from utils.swagger_parser
+# No local definition needed here anymore.
 
 
 def _clean_url_string(url_string: str) -> str:
@@ -250,7 +67,7 @@ def _clean_url_string(url_string: str) -> str:
 
 def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpoint],
                                db_tables_schema: Dict[str, List[Dict[str, str]]],
-                               existing_mappings: Dict[str, Dict[str, str]],
+                               existing_mappings: Dict[str, Dict[str, Any]],  # Changed type hint
                                thread_group_users: int,
                                ramp_up_time: int,
                                loop_count: int,
@@ -290,7 +107,7 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
     Database Schema:
     {json.dumps(db_schema_summary, indent=2)}
 
-    Existing Data Mappings (parameter -> database.column):
+    Existing Data Mappings (parameter -> source: "...", value: "..."):
     {json.dumps(existing_mappings, indent=2)}
 
     Thread Group Configuration (proposed):
@@ -365,7 +182,9 @@ def main():
         st.session_state.swagger_endpoints = []
     if 'db_tables' not in st.session_state:
         st.session_state.db_tables = []
-    if 'mappings' not in st.session_state:
+    if 'db_sampled_data' not in st.session_state:  # New: Store sampled data
+        st.session_state.db_sampled_data = {}
+    if 'mappings' not in st.session_state:  # Stores detailed mapping info
         st.session_state.mappings = {}
     if 'db_connector' not in st.session_state:
         st.session_state.db_connector = None
@@ -384,20 +203,213 @@ def main():
     if 'enable_constant_timer' not in st.session_state:
         st.session_state.enable_constant_timer = False
     if 'constant_timer_delay_ms' not in st.session_state:
-        st.session_state.constant_timer_delay_ms = 300 # Default to 300 ms
+        st.session_state.constant_timer_delay_ms = 300  # Default to 300 ms
     if 'include_scenario_assertions' not in st.session_state:
-        st.session_state.include_scenario_assertions = True # Default to True
+        st.session_state.include_scenario_assertions = True  # Default to True
     if 'test_plan_name' not in st.session_state:
-        st.session_state.test_plan_name = "Web Application Performance Test" # Default
+        st.session_state.test_plan_name = "Web Application Performance Test"  # Default
     if 'thread_group_name' not in st.session_state:
-        st.session_state.thread_group_name = "Users" # Default
+        st.session_state.thread_group_name = "Users"  # Default
     if 'select_all_endpoints' not in st.session_state:
-        st.session_state.select_all_endpoints = False # New: for select all checkbox
-    if 'jmx_content_download' not in st.session_state: # New: for persistent download
+        st.session_state.select_all_endpoints = False  # New: for select all checkbox
+    if 'jmx_content_download' not in st.session_state:  # New: for persistent download
         st.session_state.jmx_content_download = None
-    if 'csv_content_download' not in st.session_state: # New: for persistent download
+    if 'csv_content_download' not in st.session_state:  # New: for persistent download
         st.session_state.csv_content_download = None
+    if 'mapping_metadata_download' not in st.session_state:  # New: for mapping metadata
+        st.session_state.mapping_metadata_download = None
+    if 'full_swagger_spec_download' not in st.session_state:  # New: for full swagger spec download
+        st.session_state.full_swagger_spec_download = None
 
+    # New Auth State
+    if 'enable_auth_flow' not in st.session_state:
+        st.session_state.enable_auth_flow = False
+    if 'auth_login_endpoint_path' not in st.session_state:
+        st.session_state.auth_login_endpoint_path = "/user/login"  # Updated example
+    if 'auth_login_method' not in st.session_state:
+        st.session_state.auth_login_method = "POST"
+    if 'auth_login_username_param' not in st.session_state:  # For dynamic login
+        st.session_state.auth_login_username_param = "username"
+    if 'auth_login_password_param' not in st.session_state:  # For dynamic login
+        st.session_state.auth_login_password_param = "password"
+    if 'auth_login_body_template' not in st.session_state:  # Use template for dynamic body
+        st.session_state.auth_login_body_template = '{"username": "${csv_users_username}", "password": "${csv_users_password}"}'
+    if 'auth_token_json_path' not in st.session_state:
+        st.session_state.auth_token_json_path = "$.access_token"
+    if 'auth_header_name' not in st.session_state:
+        st.session_state.auth_header_name = "Authorization"
+    if 'auth_header_prefix' not in st.session_state:
+        st.session_state.auth_header_prefix = "Bearer "
+
+    # Database connection parameters for MySQL/PostgreSQL
+    if 'db_host' not in st.session_state:
+        st.session_state.db_host = ""
+    if 'db_user' not in st.session_state:
+        st.session_state.db_user = ""
+    if 'db_password' not in st.session_state:
+        st.session_state.db_password = ""
+    if 'db_name' not in st.session_state:
+        st.session_state.db_name = ""
+    if 'db_type_selected' not in st.session_state:  # Keep track of selected DB type
+        st.session_state.db_type_selected = "SQLite"  # Default
+
+    # Helper function to recursively build JSON body based on schema and mappings
+    def _build_recursive_json_body(schema: Dict[str, Any], endpoint_key: str,
+                                   current_path_segments: List[str],
+                                   extracted_vars: Dict[str, str]) -> Any:
+        """
+        Recursively builds a JSON body (or part of it) based on schema definitions,
+        integrating mappings and extracted variables.
+        Ensures required fields are populated with appropriate dummy values if no specific mapping exists.
+        """
+        logger.debug(
+            f"Entering _build_recursive_json_body for path: {'.'.join(current_path_segments)}, schema: {schema}")
+
+        if not isinstance(schema, dict):
+            logger.debug(f"Schema is not a dictionary: {schema}. Returning as is.")
+            return schema
+
+        schema_type = schema.get('type', 'object')
+        required_properties = schema.get('required', [])  # Get list of required properties
+
+        if schema_type == 'object':
+            body_obj = {}
+            properties = schema.get('properties', {})
+
+            # Iterate through all properties defined in the schema
+            for prop_name, prop_details in properties.items():
+                full_param_name = ".".join(current_path_segments + [prop_name])
+
+                # Priority 1: Extracted variables from previous responses
+                if prop_name.lower() in extracted_vars:
+                    body_obj[prop_name] = extracted_vars[prop_name.lower()]
+                    logger.debug(
+                        f"Prop '{full_param_name}' populated from extracted var: {extracted_vars[prop_name.lower()]}")
+                    continue
+
+                # Priority 2: Explicit mappings from DataMapper (DB, Generated, Static)
+                mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(full_param_name)
+
+                if mapping_info:
+                    # For CSV variables or generated functions, embed as string literal for JMeter to resolve
+                    if isinstance(mapping_info['value'], str) and mapping_info['value'].startswith("${") and \
+                            mapping_info['value'].endswith("}"):
+                        body_obj[prop_name] = mapping_info['value']
+                        logger.debug(
+                            f"Prop '{full_param_name}' populated from mapping (JMeter var): {mapping_info['value']}")
+                    else:  # Directly use the mapped value, attempt type conversion if needed
+                        target_type = prop_details.get('type', mapping_info.get('type', 'string'))
+                        if target_type == 'integer':
+                            try:
+                                body_obj[prop_name] = int(mapping_info['value'])
+                            except (ValueError, TypeError):
+                                body_obj[prop_name] = mapping_info['value']
+                        elif target_type == 'boolean':
+                            body_obj[prop_name] = str(mapping_info['value']).lower() == 'true'
+                        else:
+                            body_obj[prop_name] = mapping_info['value']
+                        logger.debug(
+                            f"Prop '{full_param_name}' populated from mapping (direct value): {mapping_info['value']}")
+                    continue  # Move to next property after populating from mapping
+
+                # Priority 3: Recursively build for nested objects/arrays, or generate dummy for required primitives
+                if prop_details.get('type') == 'object':
+                    body_obj[prop_name] = _build_recursive_json_body(
+                        prop_details, endpoint_key, current_path_segments + [prop_name], extracted_vars
+                    )
+                    logger.debug(f"Prop '{full_param_name}' populated by recursive call (object).")
+                elif prop_details.get('type') == 'array':
+                    if 'items' in prop_details:
+                        array_item_path_segments = current_path_segments + [prop_name, "_item"]
+                        item_mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(
+                            ".".join(array_item_path_segments[:-1]))
+
+                        if item_mapping_info and isinstance(item_mapping_info['value'], list):
+                            body_obj[prop_name] = item_mapping_info['value']
+                            logger.debug(f"Prop '{full_param_name}' (array) populated from explicit list mapping.")
+                        else:
+                            # Generate one item for the array as a sample
+                            body_obj[prop_name] = [_build_recursive_json_body(
+                                prop_details['items'], endpoint_key, array_item_path_segments, extracted_vars
+                            )]
+                            logger.debug(f"Prop '{full_param_name}' (array) populated by recursive call for item.")
+                    else:
+                        body_obj[prop_name] = []  # Empty array if no items schema
+                        logger.debug(f"Prop '{full_param_name}' (array) populated as empty (no item schema).")
+                else:  # Primitive type (string, integer, boolean, number etc.)
+                    # Always assign a dummy value if not populated by extracted vars or explicit mappings,
+                    # to ensure complete request body for required objects/parameters.
+                    prop_type = prop_details.get('type', 'string')
+                    if prop_type == 'string':
+                        body_obj[prop_name] = f"dummy_{prop_name}"
+                    elif prop_type == 'integer':
+                        body_obj[prop_name] = 789
+                    elif prop_type == 'boolean':
+                        body_obj[prop_name] = True
+                    elif prop_type == 'number':
+                        body_obj[prop_name] = 789.0
+                    else:
+                        body_obj[prop_name] = "<<UNSUPPORTED_PRIMITIVE_TYPE>>"
+                    logger.debug(
+                        f"Prop '{full_param_name}' (primitive, no mapping) populated with dummy: {body_obj[prop_name]}")
+
+            return body_obj
+
+        elif schema_type == 'array':
+            logger.debug(f"Schema is an array. Path: {'.'.join(current_path_segments)}")
+            if 'items' in schema:
+                # Check for a direct mapping of the root array (e.g., if the entire body is mapped to a CSV variable for an array)
+                root_array_mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(
+                    ".".join(current_path_segments))
+                if root_array_mapping_info and isinstance(root_array_mapping_info['value'], list):
+                    logger.debug(
+                        f"Root array body populated from explicit list mapping: {root_array_mapping_info['value']}")
+                    return root_array_mapping_info['value']
+                else:
+                    # Generate a single item for the array as a sample based on its item schema
+                    generated_item = _build_recursive_json_body(
+                        schema['items'], endpoint_key, current_path_segments + ["_item"], extracted_vars
+                    )
+                    logger.debug(f"Root array body populated with one recursive item: {generated_item}")
+                    return [generated_item]
+            else:
+                logger.debug("Root array body populated as empty (no item schema).")
+                return []
+
+                # Handle primitive types directly at the current level (e.g., if body is just a string or integer)
+        elif schema_type in ['string', 'integer', 'boolean', 'number']:
+            logger.debug(f"Schema is a primitive type: {schema_type}. Path: {'.'.join(current_path_segments)}")
+            mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(".".join(current_path_segments))
+            if mapping_info:
+                if schema_type == 'integer':
+                    try:
+                        return int(mapping_info['value'])
+                    except (ValueError, TypeError):
+                        return mapping_info['value']
+                elif schema_type == 'boolean':
+                    return str(mapping_info['value']).lower() == 'true'
+                elif schema_type == 'number':
+                    try:
+                        return float(mapping_info['value'])
+                    except (ValueError, TypeError):
+                        return mapping_info['value']
+                else:  # string
+                    return mapping_info['value']
+            else:
+                # Provide a default/dummy for a root-level primitive body
+                if schema_type == 'string':
+                    return "dummy_root_string_body"
+                elif schema_type == 'integer':
+                    return 789
+                elif schema_type == 'boolean':
+                    return True
+                elif schema_type == 'number':
+                    return 789.0
+                else:
+                    return "<<UNSUPPORTED_ROOT_PRIMITIVE_TYPE>>"
+        else:
+            logger.warning(f"Unsupported schema type at root: {schema_type}. Path: {'.'.join(current_path_segments)}")
+            return "<<UNSUPPORTED_BODY_TYPE>>"
 
     # Create three columns for the main inputs
     col1, col2, col3 = st.columns(3)
@@ -413,20 +425,25 @@ def main():
         logger.debug(f"Swagger URL after cleaning: {repr(swagger_url)}")
 
         if st.button("Fetch Swagger", key="fetch_swagger") or \
-           (swagger_url and swagger_url != st.session_state.current_swagger_url and not st.session_state.swagger_endpoints):
+                (
+                        swagger_url and swagger_url != st.session_state.current_swagger_url and not st.session_state.swagger_endpoints):
             if swagger_url:
                 with st.spinner("Fetching Swagger specification..."):
                     try:
                         parser = SwaggerParser(swagger_url)
                         endpoints = parser.extract_endpoints()
                         st.session_state.swagger_endpoints = endpoints
-                        st.session_state.swagger_parser = parser # Store the parser instance to access swagger_data
+                        st.session_state.swagger_parser = parser  # Store the parser instance to access swagger_data
                         st.session_state.current_swagger_url = swagger_url
+
+                        # Clear scenario and generated outputs on new Swagger fetch for isolation
                         st.session_state.selected_endpoint_keys = []
                         st.session_state.scenario_requests_configs = []
-                        # Clear previous download content on new fetch
                         st.session_state.jmx_content_download = None
                         st.session_state.csv_content_download = None
+                        st.session_state.mapping_metadata_download = None
+                        st.session_state.full_swagger_spec_download = None  # Clear full spec on new fetch
+                        st.session_state.mappings = {}  # Clear mappings too
                         st.success(f"Found {len(endpoints)} API endpoints.")
                     except Exception as e:
                         st.error(f"Failed to fetch Swagger: {str(e)}")
@@ -435,6 +452,9 @@ def main():
                         st.session_state.scenario_requests_configs = []
                         st.session_state.jmx_content_download = None
                         st.session_state.csv_content_download = None
+                        st.session_state.mapping_metadata_download = None
+                        st.session_state.full_swagger_spec_download = None
+                        st.session_state.mappings = {}
             else:
                 st.warning("Please enter a Swagger JSON URL.")
 
@@ -445,56 +465,83 @@ def main():
             if len(st.session_state.swagger_endpoints) > 5:
                 st.info(f"... and {len(st.session_state.swagger_endpoints) - 5} more endpoints")
 
+            # Make the full swagger spec available for download after fetch
+            if st.session_state.swagger_parser and st.session_state.swagger_parser.swagger_data:
+                st.session_state.full_swagger_spec_download = json.dumps(
+                    st.session_state.swagger_parser.get_full_swagger_spec(), indent=2
+                )
+
     with col2:
         st.header("🗄️ Database Configuration")
 
-        db_type = st.selectbox("Database Type", ["SQLite", "MySQL", "PostgreSQL"], key="db_type_select")
+        st.session_state.db_type_selected = st.selectbox(
+            "Database Type",
+            ["SQLite", "MySQL", "PostgreSQL"],
+            key="db_type_select",
+            index=["SQLite", "MySQL", "PostgreSQL"].index(st.session_state.db_type_selected)
+        )
 
-        db_file = ""
-        db_config = None
-        if db_type == "SQLite":
-            db_file = st.text_input(
-                "Database File Path",
+        db_connection_params_changed = False
+        if st.session_state.db_type_selected == "SQLite":
+            db_file_path = st.text_input(
+                "SQLite Database File Path",
                 value="database/petstore.db",
-                help="Path to your SQLite database file"
+                help="Path to your SQLite database file (e.g., database/petstore.db)"
             )
-            db_config = DatabaseConfig(db_type="sqlite", file_path=db_file)
-        else:
-            st.info("MySQL/PostgreSQL support coming soon!")
+            current_config_str = f"sqlite:///{db_file_path}"
+            db_config = DatabaseConfig(connection_string=current_config_str, db_type="sqlite", file_path=db_file_path)
 
-        if st.button("Connect Database", key="connect_db") and db_config:
-            if db_type == "SQLite" and not os.path.exists(db_file):
-                st.error(f"Database file not found at: {db_file}. Please ensure the file exists or create it.")
-                if st.button("Create Dummy SQLite DB", key="create_dummy_db"):
-                    try:
-                        os.makedirs(os.path.dirname(db_file), exist_ok=True)
-                        conn = sqlite3.connect(db_file)
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            CREATE TABLE IF NOT EXISTS pets (
-                                id INTEGER PRIMARY KEY,
-                                name TEXT NOT NULL,
-                                status TEXT NOT NULL,
-                                tags TEXT
-                            );
-                        """)
-                        cursor.execute("""
-                            CREATE TABLE IF NOT EXISTS users (
-                                id INTEGER PRIMARY KEY,
-                                username TEXT NOT NULL,
-                                password TEXT NOT NULL,
-                                email TEXT
-                            );
-                        """)
-                        cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Buddy', 'available', 'dog,friendly');")
-                        cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Whiskers', 'pending', 'cat');")
-                        cursor.execute("INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
-                        conn.commit()
-                        conn.close()
-                        st.success(f"Dummy SQLite database created at {db_file} with sample data.")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(f"Error creating dummy DB: {ex}")
+            # Check if relevant config changed
+            if db_file_path != st.session_state.get('last_db_file_path', ''):
+                db_connection_params_changed = True
+                st.session_state.last_db_file_path = db_file_path
+
+        else:  # MySQL or PostgreSQL
+            st.warning(
+                f"Note: Live connection to {st.session_state.db_type_selected} is simulated in this environment. Schema and data will be dummy.")
+            db_host_input = st.text_input("DB Host", value=st.session_state.db_host, key="db_host_input")
+            db_user_input = st.text_input("DB Username", value=st.session_state.db_user, key="db_user_input")
+            db_password_input = st.text_input("DB Password", type="password", value=st.session_state.db_password,
+                                              key="db_password_input")
+            db_name_input = st.text_input("DB Name", value=st.session_state.db_name, key="db_name_input")
+
+            db_config = DatabaseConfig(
+                db_type=st.session_state.db_type_selected.lower(),
+                host=db_host_input,
+                username=db_user_input,
+                password=db_password_input,
+                database=db_name_input
+            )
+
+            # Check if relevant config changed
+            if (db_host_input != st.session_state.db_host or
+                    db_user_input != st.session_state.db_user or
+                    db_password_input != st.session_state.db_password or
+                    db_name_input != st.session_state.db_name):
+                db_connection_params_changed = True
+                st.session_state.db_host = db_host_input
+                st.session_state.db_user = db_user_input
+                st.session_state.db_password = db_password_input
+                st.session_state.db_name = db_name_input
+
+        if st.button("Connect Database",
+                     key="connect_db") or db_connection_params_changed:  # Auto-reconnect if params change
+            if st.session_state.db_type_selected == "SQLite" and not db_file_path:
+                st.error("Please enter a SQLite database file path.")
+                st.session_state.db_tables = []
+                st.session_state.db_connector = None
+                st.session_state.db_tables_schema = {}
+                st.session_state.db_sampled_data = {}
+                st.session_state.mappings = {}  # Clear mappings
+            elif st.session_state.db_type_selected != "SQLite" and not (
+                    db_config.host and db_config.username and db_config.database):
+                st.error(
+                    f"Please provide Host, Username, and Database for {st.session_state.db_type_selected} connection.")
+                st.session_state.db_tables = []
+                st.session_state.db_connector = None
+                st.session_state.db_tables_schema = {}
+                st.session_state.db_sampled_data = {}
+                st.session_state.mappings = {}  # Clear mappings
             else:
                 with st.spinner("Connecting to database..."):
                     try:
@@ -503,27 +550,162 @@ def main():
                             st.session_state.db_connector = connector
                             tables = connector.get_tables()
                             st.session_state.db_tables = tables
+
                             tables_schema = {}
+                            sampled_data = {}
                             for table in tables:
                                 schema = connector.get_table_schema(table)
                                 tables_schema[table] = schema
+                                # Sample 3 rows for each table
+                                sampled_data[table] = connector.preview_data(table, limit=3)
+
                             st.session_state.db_tables_schema = tables_schema
-                            st.success(f"Connected! Found {len(tables)} tables")
-                            # Clear previous download content on new DB connect
+                            st.session_state.db_sampled_data = sampled_data  # Store sampled data
+
+                            # Clear previous mappings and generated output on new DB connection
+                            st.session_state.mappings = {}
                             st.session_state.jmx_content_download = None
                             st.session_state.csv_content_download = None
+                            st.session_state.mapping_metadata_download = None
+
+                            st.success(f"Connected to {connector.config.db_type.upper()}! Found {len(tables)} tables.")
+
+                            # For SQLite, if dummy DB does not exist, offer to create
+                            if st.session_state.db_type_selected == "SQLite" and not os.path.exists(db_file_path):
+                                if st.button("Create Dummy SQLite DB", key="create_dummy_db_on_connect"):
+                                    try:
+                                        os.makedirs(os.path.dirname(db_file_path), exist_ok=True)
+                                        conn = sqlite3.connect(db_file_path)
+                                        cursor = conn.cursor()
+                                        cursor.execute("""
+                                                       CREATE TABLE IF NOT EXISTS pets
+                                                       (
+                                                           id
+                                                           INTEGER
+                                                           PRIMARY
+                                                           KEY,
+                                                           name
+                                                           TEXT
+                                                           NOT
+                                                           NULL,
+                                                           status
+                                                           TEXT
+                                                           NOT
+                                                           NULL,
+                                                           tags
+                                                           TEXT
+                                                       );
+                                                       """)
+                                        cursor.execute("""
+                                                       CREATE TABLE IF NOT EXISTS users
+                                                       (
+                                                           id
+                                                           INTEGER
+                                                           PRIMARY
+                                                           KEY,
+                                                           username
+                                                           TEXT
+                                                           NOT
+                                                           NULL,
+                                                           password
+                                                           TEXT
+                                                           NOT
+                                                           NULL,
+                                                           email
+                                                           TEXT,
+                                                           role_id
+                                                           INTEGER
+                                                       );
+                                                       """)
+                                        cursor.execute("""
+                                                       CREATE TABLE IF NOT EXISTS orders
+                                                       (
+                                                           order_id
+                                                           INTEGER
+                                                           PRIMARY
+                                                           KEY,
+                                                           user_id
+                                                           INTEGER,
+                                                           status
+                                                           TEXT
+                                                       );
+                                                       """)
+                                        cursor.execute("""
+                                                       CREATE TABLE IF NOT EXISTS inventory_items
+                                                       (
+                                                           item_id
+                                                           INTEGER
+                                                           PRIMARY
+                                                           KEY,
+                                                           product_id
+                                                           INTEGER,
+                                                           quantity
+                                                           INTEGER
+                                                       );
+                                                       """)
+                                        cursor.execute("""
+                                                       CREATE TABLE IF NOT EXISTS roles
+                                                       (
+                                                           id
+                                                           INTEGER
+                                                           PRIMARY
+                                                           KEY,
+                                                           role_name
+                                                           TEXT
+                                                       );
+                                                       """)
+                                        cursor.execute(
+                                            "INSERT INTO pets (id, name, status, tags) VALUES (1, 'Buddy', 'available', 'dog,friendly');")
+                                        cursor.execute(
+                                            "INSERT INTO pets (id, name, status, tags) VALUES (2, 'Whiskers', 'pending', 'cat');")
+                                        cursor.execute(
+                                            "INSERT INTO users (id, username, password, email, role_id) VALUES (101, 'testuser', 'testpass', 'test@example.com', 1);")
+                                        cursor.execute(
+                                            "INSERT INTO users (id, username, password, email, role_id) VALUES (102, 'user2', 'pass2', 'user2@example.com', 2);")
+                                        cursor.execute(
+                                            "INSERT INTO orders (order_id, user_id, status) VALUES (1001, 101, 'pending');")
+                                        cursor.execute(
+                                            "INSERT INTO orders (order_id, user_id, status) VALUES (1002, 102, 'completed');")
+                                        cursor.execute(
+                                            "INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (1, 1, 50);")
+                                        cursor.execute(
+                                            "INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (2, 2, 120);")
+                                        cursor.execute("INSERT INTO roles (id, role_name) VALUES (1, 'Admin');")
+                                        cursor.execute("INSERT INTO roles (id, role_name) VALUES (2, 'User');")
+                                        conn.commit()
+                                        conn.close()
+                                        st.success(f"Dummy SQLite database created at {db_file_path} with sample data.")
+                                        st.rerun()  # Rerun to re-connect and load data
+                                    except Exception as ex:
+                                        st.error(f"Error creating dummy DB: {ex}")
+
                         else:
-                            st.error("Failed to connect to database")
+                            st.error("Failed to connect to database. Check connection parameters and logs.")
+                            st.session_state.db_tables = []
+                            st.session_state.db_connector = None
+                            st.session_state.db_tables_schema = {}
+                            st.session_state.db_sampled_data = {}
+                            st.session_state.mappings = {}
                     except Exception as e:
                         st.error(f"Database connection error: {str(e)}")
                         st.session_state.db_tables = []
-                        st.session_state.jmx_content_download = None
-                        st.session_state.csv_content_download = None
+                        st.session_state.db_connector = None
+                        st.session_state.db_tables_schema = {}
+                        st.session_state.db_sampled_data = {}
+                        st.session_state.mappings = {}
 
         if st.session_state.db_tables:
             st.subheader("Database Tables")
             for table in st.session_state.db_tables:
                 st.code(table)
+
+            st.subheader("Sampled Data (First 3 Rows)")
+            for table_name, df in st.session_state.db_sampled_data.items():
+                if not df.empty:
+                    st.write(f"**Table: {table_name}**")
+                    st.dataframe(df)
+                else:
+                    st.info(f"No data sampled for table: {table_name}")
 
     with col3:
         st.header("🤖 AI Assistance & API Key")
@@ -537,7 +719,7 @@ def main():
 
         prompt = st.text_area(
             "Describe your test scenario (for AI suggestions)",
-            value="Generate a JMeter script that covers all available API endpoints. For each endpoint, use mapped database fields if available, otherwise generate dummy data. Aim for a typical user flow involving GET, POST, PUT, and DELETE operations where appropriate.",
+            value="Generate a JMeter script that covers all available API endpoints. For each endpoint, use mapped database fields if available, otherwise generate dummy data. Aim for a typical user flow involving GET, POST, PUT, and DELETE operations where appropriate. If possible, include an authentication flow by logging in first and using the obtained token.",
             height=100
         )
 
@@ -550,13 +732,12 @@ def main():
                 st.error("Please provide your Gemini API Key to get AI suggestions.")
             else:
                 with st.spinner("Getting AI mapping and scenario suggestions..."):
-                    if not st.session_state.mappings:
-                        tables_schema_for_mapping = {}
-                        for table in st.session_state.db_tables:
-                            schema = st.session_state.db_connector.get_table_schema(table)
-                            tables_schema_for_mapping[table] = schema
-                        st.session_state.mappings = DataMapper.suggest_mappings(st.session_state.swagger_endpoints,
-                                                                                tables_schema_for_mapping)
+                    # Recalculate mappings including sampled data logic
+                    st.session_state.mappings = DataMapper.suggest_mappings(
+                        st.session_state.swagger_endpoints,
+                        st.session_state.db_tables_schema,
+                        st.session_state.db_sampled_data  # Pass sampled data here
+                    )
 
                     llm_response = call_llm_for_scenario_plan(
                         prompt=prompt,
@@ -574,7 +755,6 @@ def main():
             st.subheader("AI Suggested Test Flow (Read-Only)")
             st.markdown(st.session_state.llm_suggestion)
             st.info("Use this as a guide to configure your scenario below.")
-
 
     st.header("2. Load Profile Configuration")
     col1, col2, col3 = st.columns(3)
@@ -657,6 +837,68 @@ def main():
             help="If checked, a 'Response Code 200' assertion will be added to each request in the scenario."
         )
 
+    st.header("2.2 Authentication Flow Configuration")
+    st.session_state.enable_auth_flow = st.checkbox(
+        "Enable Authentication Flow",
+        value=st.session_state.enable_auth_flow,
+        key="enable_auth_flow_checkbox"
+    )
+
+    if st.session_state.enable_auth_flow:
+        st.session_state.auth_login_endpoint_path = st.text_input(
+            "Login API Endpoint Path",
+            value=st.session_state.auth_login_endpoint_path,
+            key="auth_login_endpoint_path_input",
+            help="e.g., /auth/login. Must exist in Swagger spec."
+        )
+        st.session_state.auth_login_method = st.selectbox(
+            "Login API Method",
+            options=["POST", "GET", "PUT"],
+            index=["POST", "GET", "PUT"].index(st.session_state.auth_login_method),
+            key="auth_login_method_select"
+        )
+
+        st.markdown("**Login Request Body Configuration**")
+        st.info("You can use CSV variables (e.g., `${csv_users_username}`) if your DB has user credentials.")
+
+        st.session_state.auth_login_username_param = st.text_input(
+            "Username Parameter Name (in body)",
+            value=st.session_state.auth_login_username_param,
+            key="auth_login_username_param_input",
+            help="Name of the field in the login request body for username (e.g., 'username')."
+        )
+        st.session_state.auth_login_password_param = st.text_input(
+            "Password Parameter Name (in body)",
+            value=st.session_state.auth_login_password_param,
+            key="auth_login_password_param_input",
+            help="Name of the field in the login request body for password (e.g., 'password')."
+        )
+        st.session_state.auth_login_body_template = st.text_area(
+            "Login Request Body Template (JSON)",
+            value=st.session_state.auth_login_body_template,
+            key="auth_login_body_template_textarea",
+            height=100,
+            help="JSON body for login request. Use JMeter variables like ${csv_users_username}."
+        )
+
+        st.session_state.auth_token_json_path = st.text_input(
+            "Auth Token JSON Path (from Login Response)",
+            value=st.session_state.auth_token_json_path,
+            key="auth_token_json_path_input",
+            help="JSONPath expression to extract token, e.g., $.access_token"
+        )
+        st.session_state.auth_header_name = st.text_input(
+            "Authorization Header Name",
+            value=st.session_state.auth_header_name,
+            key="auth_header_name_input",
+            help="e.g., Authorization"
+        )
+        st.session_state.auth_header_prefix = st.text_input(
+            "Authorization Header Prefix",
+            value=st.session_state.auth_header_prefix,
+            key="auth_header_prefix_input",
+            help="e.g., Bearer "
+        )
 
     st.header("3. Select Endpoints for Scenario")
     if st.session_state.swagger_endpoints:
@@ -672,44 +914,118 @@ def main():
         else:
             default_selected_endpoints = st.session_state.selected_endpoint_keys
 
-
         selected_endpoint_keys = st.multiselect(
             "Select API Endpoints for your scenario (order reflects execution sequence)",
             options=endpoint_options,
-            default=default_selected_endpoints, # Use the dynamic default
+            default=default_selected_endpoints,  # Use the dynamic default
             key="endpoint_selector"
         )
 
-        # Update session state if multiselect value changes or select all is toggled
-        if selected_endpoint_keys != st.session_state.selected_endpoint_keys: # This check is important
+        # Recalculate scenario configurations when endpoints change or "Refresh" is clicked
+        if selected_endpoint_keys != st.session_state.selected_endpoint_keys or st.button(
+                "Refresh Scenario Configuration", key="refresh_scenario_btn"):
             st.session_state.selected_endpoint_keys = selected_endpoint_keys
             new_scenario_configs = []
 
-            if not st.session_state.mappings and st.session_state.db_tables:
-                tables_schema_for_mapping = {}
-                for table in st.session_state.db_tables:
-                    schema = st.session_state.db_connector.get_table_schema(table)
-                    tables_schema_for_mapping[table] = schema
-                st.session_state.mappings = DataMapper.suggest_mappings(st.session_state.swagger_endpoints,
-                                                                        tables_schema_for_mapping)
+            # Recalculate mappings if not already done or if DB/Swagger changed
+            st.session_state.mappings = DataMapper.suggest_mappings(
+                st.session_state.swagger_endpoints,
+                st.session_state.db_tables_schema,
+                st.session_state.db_sampled_data
+            )
+
+            extracted_variables_map = {}  # {parameter_name_lower: JMeter_variable_name}
+
+            # --- Add Login Request if authentication is enabled ---
+            if st.session_state.enable_auth_flow:
+                # For login, still rely on the endpoint object for basic path/method lookup
+                login_endpoint = next((ep for ep in st.session_state.swagger_endpoints if
+                                       ep.path == st.session_state.auth_login_endpoint_path and ep.method == st.session_state.auth_login_method),
+                                      None)
+                if login_endpoint:
+                    # Login body template is handled separately
+                    resolved_login_body = st.session_state.auth_login_body_template
+
+                    login_request_config = {
+                        "endpoint_key": f"{login_endpoint.method} {login_endpoint.path}",
+                        "name": "Login_Request",
+                        "method": login_endpoint.method,
+                        "path": login_endpoint.path,
+                        "parameters": {},
+                        "headers": {"Content-Type": "application/json"},
+                        "body": resolved_login_body,
+                        "assertions": [{"type": "Response Code", "value": "200"}],
+                        "json_extractors": [
+                            {
+                                "json_path_expr": st.session_state.auth_token_json_path,
+                                "var_name": "authToken"
+                            }
+                        ],
+                        "think_time": 0
+                    }
+                    new_scenario_configs.append(login_request_config)
+                    extracted_variables_map["authtoken"] = "${authToken}"
+                else:
+                    st.warning(
+                        f"Login endpoint {st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path} not found in Swagger spec. Authentication flow might not work as expected.")
+
+            # For selected endpoints in the main scenario
+            full_swagger_spec = st.session_state.swagger_parser.get_full_swagger_spec()
+            base_path_from_swagger = full_swagger_spec.get('basePath', '')
 
             for ep_key in selected_endpoint_keys:
-                current_endpoint = next((ep for ep in st.session_state.swagger_endpoints if f"{ep.method} {ep.path}" == ep_key), None)
+                method_str, path_str = ep_key.split(' ', 1)
+                method_key = method_str.lower()
 
-                if current_endpoint:
-                    # New Naming Convention
-                    clean_path_name = re.sub(r'[^\w\s-]', '', current_endpoint.path).replace('/', '_').strip('_')
-                    if current_endpoint.operation_id:
-                        request_name = f"{current_endpoint.method}_{current_endpoint.operation_id}"
+                resolved_endpoint_data = full_swagger_spec.get('paths', {}).get(path_str, {}).get(method_key, {})
+
+                if resolved_endpoint_data:
+                    clean_path_name = re.sub(r'[^\w\s-]', '', path_str).replace('/', '_').strip('_')
+                    operation_id = resolved_endpoint_data.get('operationId')
+                    if operation_id:
+                        request_name = f"{method_str}_{operation_id}"
                     else:
-                        request_name = f"{current_endpoint.method}_{clean_path_name}"
+                        request_name = f"{method_str}_{clean_path_name}"
+
+                    # Start with the raw path from Swagger
+                    jmeter_formatted_path = path_str
+
+                    # Process path parameters and convert to JMeter variables
+                    if 'parameters' in resolved_endpoint_data:
+                        for param in resolved_endpoint_data['parameters']:
+                            if param.get('in') == 'path':
+                                param_name = param['name']
+
+                                jmeter_var_for_path_param = f"${{{param_name}}}"  # Default fallback
+
+                                if param_name.lower() in extracted_variables_map:
+                                    jmeter_var_for_path_param = extracted_variables_map[param_name.lower()]
+                                    logger.debug(
+                                        f"Path param '{param_name}' for {ep_key} using extracted variable: {jmeter_var_for_path_param}")
+                                else:
+                                    mapping_info = st.session_state.mappings.get(ep_key, {}).get(param_name)
+                                    if mapping_info and mapping_info['source'] == "DB Sample (CSV)":
+                                        jmeter_var_for_path_param = mapping_info['value']
+                                        logger.debug(
+                                            f"Path param '{param_name}' for {ep_key} using CSV mapping: {jmeter_var_for_path_param}")
+                                    else:
+                                        logger.warning(
+                                            f"Path param '{param_name}' for {ep_key} has no explicit DB/extraction mapping. Using generic JMeter variable: {jmeter_var_for_path_param}")
+
+                                # Replace {paramName} with ${jmeterVarName}
+                                jmeter_formatted_path = jmeter_formatted_path.replace(f"{{{param_name}}}",
+                                                                                      jmeter_var_for_path_param)
+
+                    # Prepend the base path from Swagger. Ensure no double slashes.
+                    final_request_path_for_jmeter = f"{base_path_from_swagger}{jmeter_formatted_path}"
+                    final_request_path_for_jmeter = final_request_path_for_jmeter.replace('//', '/')
 
                     request_config = {
                         "endpoint_key": ep_key,
-                        "name": request_name, # Use new naming convention
-                        "method": current_endpoint.method,
-                        "path": current_endpoint.path,
-                        "parameters": {},
+                        "name": request_name,
+                        "method": method_str,
+                        "path": final_request_path_for_jmeter,  # This is the crucial line
+                        "parameters": {},  # Query parameters are handled below
                         "headers": {},
                         "body": None,
                         "assertions": [],
@@ -717,75 +1033,145 @@ def main():
                         "think_time": 0
                     }
 
-                    if current_endpoint.parameters:
-                        for param in current_endpoint.parameters:
-                            if param.get('in') in ['query', 'path']:
-                                mapped_value = st.session_state.mappings.get(ep_key, {}).get(param['name'], None)
-                                if mapped_value:
-                                    request_config['parameters'][param['name']] = f"${{{mapped_value}}}"
+                    # Add Authorization header if auth flow is enabled and it's not the login request itself
+                    if st.session_state.enable_auth_flow and ep_key != f"{st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path}":
+                        if "authtoken" in extracted_variables_map:
+                            request_config["headers"][
+                                st.session_state.auth_header_name] = f"{st.session_state.auth_header_prefix}{extracted_variables_map['authtoken']}"
+                        else:
+                            st.warning(
+                                f"Authentication flow enabled but auth token not found for {ep_key}. Check login configuration.")
+
+                    # Process URL/Query parameters
+                    if 'parameters' in resolved_endpoint_data:
+                        for param in resolved_endpoint_data['parameters']:
+                            if param.get('in') == 'query':
+                                if param['name'].lower() in extracted_variables_map:
+                                    request_config['parameters'][param['name']] = extracted_variables_map[
+                                        param['name'].lower()]
                                 else:
-                                    if param.get('type') == 'string':
-                                        request_config['parameters'][param['name']] = f"dummy_{param['name']}"
-                                    elif param.get('type') == 'integer':
-                                        request_config['parameters'][param['name']] = "123"
-                                    elif param.get('type') == 'boolean':
-                                        request_config['parameters'][param['name']] = "true"
+                                    mapping_info = st.session_state.mappings.get(ep_key, {}).get(param['name'])
+                                    if mapping_info:
+                                        request_config['parameters'][param['name']] = mapping_info['value']
                                     else:
-                                        request_config['parameters'][param['name']] = f"dummy_{param['name']}"
+                                        request_config['parameters'][param['name']] = "<<NO_MATCH_FOUND>>"
 
-
-                    if current_endpoint.method in ["POST", "PUT", "PATCH"]:
-                        # Set Content-Type based on Swagger 'consumes' or default
-                        content_type_header = "application/json" # Default
-                        if current_endpoint.consumes:
-                            content_type_header = current_endpoint.consumes[0] # Take the first one
+                    # Process Request Body
+                    if method_key in ["post", "put", "patch"]:
+                        # Determine Content-Type
+                        content_type_header = "application/json"
+                        if resolved_endpoint_data.get('consumes'):  # Swagger 2.0
+                            content_type_header = resolved_endpoint_data['consumes'][0]
+                        elif 'requestBody' in resolved_endpoint_data and 'content' in resolved_endpoint_data[
+                            'requestBody']:  # OpenAPI 3.0
+                            first_content_type = next(iter(resolved_endpoint_data['requestBody'].get('content', {})),
+                                                      None)
+                            if first_content_type:
+                                content_type_header = first_content_type
                         request_config["headers"]["Content-Type"] = content_type_header
 
-                        if current_endpoint.request_body and st.session_state.get('swagger_parser'):
-                            try:
-                                def resolve_ref(schema_obj, definitions):
-                                    if '$ref' in schema_obj:
-                                        ref_path = schema_obj['$ref'].split('/')
-                                        definition_name = ref_path[-1]
-                                        return definitions.get(definition_name, {})
-
-                                definitions = st.session_state.swagger_parser.swagger_data.get('definitions', {})
-                                resolved_schema = resolve_ref(current_endpoint.request_body, definitions)
-                                def_props = resolved_schema.get('properties', {})
-
-                                if def_props:
-                                    dummy_body = {}
-                                    for prop_name, prop_details in def_props.items():
-                                        if prop_details.get('type') == 'string':
-                                            dummy_body[prop_name] = f"auto_{prop_name}"
-                                        elif prop_details.get('type') == 'integer':
-                                            dummy_body[prop_name] = 456
-                                        elif prop_details.get('type') == 'boolean':
-                                            dummy_body[prop_name] = True
-                                        else:
-                                            dummy_body[prop_name] = f"auto_value_{prop_name}"
-                                    request_config["body"] = json.dumps(dummy_body, indent=2)
+                        request_body_schema = None
+                        if 'requestBody' in resolved_endpoint_data:  # OpenAPI 3.0 structure
+                            content_types = resolved_endpoint_data['requestBody'].get('content', {})
+                            if content_types:
+                                # Prioritize application/json, then the first available content type
+                                if 'application/json' in content_types:
+                                    request_body_schema = content_types['application/json'].get('schema')
                                 else:
-                                    request_config["body"] = "{\n  \"message\": \"auto-generated dummy body\"\n}"
-                            except Exception as e:
-                                logger.warning(f"Could not infer request body from schema for {ep_key}: {e}")
-                                request_config["body"] = "{\n  \"message\": \"auto-generated dummy body\"\n}"
-                        else:
-                            request_config["body"] = "{\n  \"message\": \"auto-generated dummy body\"\n}"
+                                    request_body_schema = next(iter(content_types.values())).get('schema')
+                        else:  # Swagger 2.0 structure (body parameter)
+                            for param in resolved_endpoint_data.get('parameters', []):
+                                if param.get('in') == 'body' and 'schema' in param:
+                                    request_body_schema = param['schema']
+                                    break
 
+                        logger.debug(
+                            f"Resolved request_body_schema for {ep_key}: {json.dumps(request_body_schema, indent=2)}")
+
+                        if request_body_schema:
+                            try:
+                                generated_body = _build_recursive_json_body(
+                                    request_body_schema,  # Pass the resolved schema directly
+                                    ep_key,
+                                    [],
+                                    extracted_variables_map
+                                )
+                                if isinstance(generated_body, (dict, list, int, float, bool)):
+                                    request_config["body"] = json.dumps(generated_body, indent=2)
+                                else:
+                                    request_config["body"] = str(generated_body)
+
+                            except Exception as e:
+                                logger.error(f"Error building recursive JSON body for {ep_key}: {e}", exc_info=True)
+                                request_config[
+                                    "body"] = "{\n  \"message\": \"Error building dynamic body for bodySchema from full spec\"\n}"
+                        else:
+                            request_config[
+                                "body"] = "{\n  \"message\": \"auto-generated dummy body (no schema found in full spec)\"\n}"
+
+                    # Add standard 200 assertion if enabled
                     if st.session_state.include_scenario_assertions:
                         request_config['assertions'].append({"type": "Response Code", "value": "200"})
 
+                    # --- Correlation: Auto-add JSON Extractors for response IDs ---
+                    # Get response schemas directly from resolved_endpoint_data
+                    for status_code, response_obj in resolved_endpoint_data.get('responses', {}).items():
+                        if status_code.startswith('2'):  # Successful response
+                            resp_schema = None
+                            if 'schema' in response_obj:  # Swagger 2.0
+                                resp_schema = response_obj['schema']
+                            elif 'content' in response_obj:  # OpenAPI 3.0
+                                # Get the first content type's schema
+                                first_content_type = next(iter(response_obj['content']), None)
+                                if first_content_type:
+                                    resp_schema = response_obj['content'][first_content_type].get('schema')
+
+                            if resp_schema and 'properties' in resp_schema:
+                                for prop_name, prop_details in resp_schema['properties'].items():
+                                    if (prop_name.lower() == 'id' and prop_details.get('type') in ['string',
+                                                                                                   'integer']) or \
+                                            (prop_name.lower() == 'username' and prop_details.get('type') == 'string'):
+                                        var_base_name = prop_name.replace('_', '').lower()
+                                        correlated_var_name = f"{operation_id or clean_path_name}{var_base_name.capitalize()}"
+                                        request_config['json_extractors'].append({
+                                            "json_path_expr": f"$.{prop_name}",
+                                            "var_name": correlated_var_name
+                                        })
+                                        extracted_variables_map[prop_name.lower()] = f"${{{correlated_var_name}}}"
+                                        logger.info(
+                                            f"Detected potential correlation: '{prop_name}' from {ep_key} will be extracted as ${{{correlated_var_name}}}")
+
+                            if resp_schema and resp_schema.get('type') == 'array' and 'items' in resp_schema:
+                                item_schema = resp_schema['items']
+                                if 'properties' in item_schema:
+                                    for prop_name, prop_details in item_schema['properties'].items():
+                                        if (prop_name.lower() == 'id' and prop_details.get('type') in ['string',
+                                                                                                       'integer']) or \
+                                                (prop_name.lower() == 'username' and prop_details.get(
+                                                    'type') == 'string'):
+                                            var_base_name = prop_name.replace('_', '').lower()
+                                            correlated_var_name = f"{operation_id or clean_path_name}First{var_base_name.capitalize()}"
+                                            request_config['json_extractors'].append({
+                                                "json_path_expr": f"$[0].{prop_name}",
+                                                "var_name": correlated_var_name
+                                            })
+                                            extracted_variables_map[prop_name.lower()] = f"${{{correlated_var_name}}}"
+                                            logger.info(
+                                                f"Detected array correlation: First '{prop_name}' from {ep_key} will be extracted as ${{{correlated_var_name}}}")
+
                     new_scenario_configs.append(request_config)
+                else:
+                    logger.warning(f"Could not find fully resolved endpoint data for {ep_key}. Skipping.")
 
             st.session_state.scenario_requests_configs = new_scenario_configs
-            st.rerun() # Rerun to update the displayed configurations
+            st.rerun()
 
         st.markdown("---")
         st.subheader("Selected Endpoints (Auto-Configured)")
         if st.session_state.scenario_requests_configs:
             for i, config in enumerate(st.session_state.scenario_requests_configs):
-                st.code(f"Request {i+1}: {config['method']} {config['path']} (Name: {config['name']})") # Show new name
+                st.code(
+                    f"Request {i + 1}: {config['method']} {config['path']} (Name: {config['name']})")  # Show new name
                 with st.expander(f"View Auto-Configuration for {config['name']}"):
                     st.json(config)
         else:
@@ -794,15 +1180,18 @@ def main():
     else:
         st.info("Please fetch a Swagger file to build your test scenario.")
 
-
     st.markdown("---")
 
     if st.button("Generate JMeter Script", key="generate_button_final", type="primary"):
         if not st.session_state.swagger_endpoints:
             st.error("Please fetch a Swagger/OpenAPI JSON file and ensure endpoints are parsed.")
             return
-        if not st.session_state.selected_endpoint_keys:
-            st.error("Please select at least one API request to include in your scenario.")
+        if not st.session_state.selected_endpoint_keys and not st.session_state.enable_auth_flow:
+            st.error(
+                "Please select at least one API request to include in your scenario, or enable authentication flow only.")
+            return
+        if st.session_state.enable_auth_flow and not st.session_state.auth_login_endpoint_path:
+            st.error("Authentication flow is enabled, but no Login API Endpoint Path is provided.")
             return
 
         st.info("Generating JMeter script... Please wait.")
@@ -816,26 +1205,93 @@ def main():
 
             global_constant_timer_delay = st.session_state.constant_timer_delay_ms if st.session_state.enable_constant_timer else 0
 
+            # Construct sampled data for CSV based on *actual used* mappings
+            # This ensures only variables explicitly marked as 'csv_' are included
+            csv_data_for_jmeter = {}
+            csv_headers = set()
+
+            # Iterate through the `mappings` dictionary which now contains full paths for body parameters
+            for endpoint_key, params_map in st.session_state.mappings.items():
+                for param_name, mapping_info in params_map.items():
+                    if mapping_info['source'] == "DB Sample (CSV)":
+                        jmeter_var_name_raw = mapping_info['value'].replace('${', '').replace('}',
+                                                                                              '')  # e.g., csv_users_id
+                        # Extract original table and column from jmeter_var_name
+                        parts = jmeter_var_name_raw.split('_')
+                        if len(parts) >= 3 and parts[0] == 'csv':
+                            table_name = parts[1]
+                            # Reconstruct original column name (can have underscores in DB)
+                            column_name = "_".join(parts[2:])
+
+                            if table_name in st.session_state.db_sampled_data and column_name in \
+                                    st.session_state.db_sampled_data[table_name].columns:
+                                if jmeter_var_name_raw not in csv_data_for_jmeter:
+                                    csv_data_for_jmeter[jmeter_var_name_raw] = \
+                                    st.session_state.db_sampled_data[table_name][column_name].tolist()
+                                    csv_headers.add(jmeter_var_name_raw)
+                                else:
+                                    # Ensure lists are of same length, pad if necessary for multiple uses of same column
+                                    if len(csv_data_for_jmeter[jmeter_var_name_raw]) < len(
+                                            st.session_state.db_sampled_data[table_name][column_name]):
+                                        csv_data_for_jmeter[jmeter_var_name_raw] = \
+                                        st.session_state.db_sampled_data[table_name][column_name].tolist()
+
+            generated_csv_content = None
+            if csv_headers and csv_data_for_jmeter:
+                csv_headers_list = sorted(list(csv_headers))  # Ensure consistent order
+                generated_csv_content = ",".join(csv_headers_list) + "\n"  # Use full JMeter variable names as headers
+
+                max_rows = 0
+                if csv_data_for_jmeter:
+                    max_rows = max(len(v) for v in csv_data_for_jmeter.values())
+
+                for i in range(max_rows):
+                    row_values = []
+                    for header_key in csv_headers_list:
+                        values = csv_data_for_jmeter.get(header_key, [])
+                        row_values.append(str(values[i]) if i < len(values) else "")
+                    generated_csv_content += ",".join(row_values) + "\n"
 
             generator = JMeterScriptGenerator(
                 test_plan_name=st.session_state.test_plan_name,
                 thread_group_name=st.session_state.thread_group_name
             )
-            jmx_content, csv_content = generator.generate_jmx(
-                app_base_url=swagger_url, # Use the cleaned swagger_url as base URL
+
+            # Parse base URL components from the swagger_url
+            parsed_url = urlparse(swagger_url)
+            protocol = parsed_url.scheme
+            domain = parsed_url.hostname
+            port = parsed_url.port if parsed_url.port else ""
+            # basePath for Swagger 2.0 or just a path segment for OpenAPI 3.0
+            base_path = parsed_url.path.rsplit('/', 1)[0] if parsed_url.path.endswith(
+                '.json') or parsed_url.path.endswith('.yaml') else parsed_url.path
+            if not base_path:  # Ensure base_path is at least "/" if empty
+                base_path = "/"
+
+            # Use swagger_parser instance to get the full resolved spec
+            full_resolved_swagger_spec = st.session_state.swagger_parser.get_full_swagger_spec()
+
+            jmx_content, _ = generator.generate_jmx(
+                app_base_url=swagger_url,  # Original URL for consistency
                 thread_group_users=num_users,
                 ramp_up_time=ramp_up_time,
                 loop_count=loop_count,
                 scenario_plan=scenario_plan,
-                database_connector=st.session_state.db_connector, # Pass database connector
-                db_tables_schema=st.session_state.db_tables_schema, # Pass DB tables schema
+                csv_data_to_include=generated_csv_content,  # Pass pre-generated CSV content
                 global_constant_timer_delay=global_constant_timer_delay,
-                test_plan_name=st.session_state.test_plan_name, # Passed explicitly
-                thread_group_name=st.session_state.thread_group_name # Passed explicitly
+                test_plan_name=st.session_state.test_plan_name,
+                thread_group_name=st.session_state.thread_group_name,
+                http_defaults_protocol=protocol,
+                http_defaults_domain=domain,
+                http_defaults_port=port,
+                http_defaults_base_path=base_path,
+                full_swagger_spec=full_resolved_swagger_spec  # Pass the full resolved spec
             )
 
-            st.session_state.jmx_content_download = jmx_content # Store for persistence
-            st.session_state.csv_content_download = csv_content # Store for persistence
+            st.session_state.jmx_content_download = jmx_content  # Store for persistence
+            st.session_state.csv_content_download = generated_csv_content  # Store for persistence
+            st.session_state.mapping_metadata_download = json.dumps(st.session_state.mappings,
+                                                                    indent=2)  # Store mapping metadata
 
             st.success("JMeter script generated successfully!")
 
@@ -845,6 +1301,15 @@ def main():
 
     # --- Download Links (Rendered Persistently) ---
     st.subheader("Download Generated Files")
+    if st.session_state.full_swagger_spec_download:  # New download button for full Swagger spec
+        st.download_button(
+            label="Download Full Swagger Spec (.json)",
+            data=st.session_state.full_swagger_spec_download.encode("utf-8"),
+            file_name="full_swagger_spec.json",
+            mime="application/json",
+            key="download_full_swagger_spec"
+        )
+
     if st.session_state.jmx_content_download:
         st.download_button(
             label="Download JMeter Test Plan (.jmx)",
@@ -862,14 +1327,25 @@ def main():
             mime="text/csv",
             key="download_csv_final"
         )
-    elif st.session_state.jmx_content_download: # Only show info if JMX is generated but CSV is not
-        st.info("No CSV data was generated for this test plan.")
+    elif st.session_state.jmx_content_download:  # Only show info if JMX is generated but CSV is not
+        st.info("No CSV data was generated for this test plan (no DB mappings used).")
     else:
         st.info("Generate the JMeter script above to enable download links.")
 
+    if st.session_state.mapping_metadata_download:
+        st.download_button(
+            label="Download Mapping Metadata (.json)",
+            data=st.session_state.mapping_metadata_download.encode("utf-8"),
+            file_name="mapping_metadata.json",
+            mime="application/json",
+            key="download_mapping_metadata"
+        )
+    else:
+        st.info("Mapping metadata will be available after script generation.")
 
     st.markdown("---")
     st.markdown("Developed with ❤️ by Your AI Assistant")
+
 
 if __name__ == "__main__":
     # Ensure dummy swagger.json and petstore.db exist for initial run
@@ -878,22 +1354,214 @@ if __name__ == "__main__":
 {
   "swagger": "2.0",
   "info": {
-    "version": "1.0.0",
-    "title": "Swagger Petstore"
+    "description": "This is a sample server Petstore server.  You can find out more about Swagger at [http://swagger.io](http://swagger.io) or on [irc.freenode.net, #swagger](http://swagger.io/irc/).  For this sample, you can use the api key `special-key` to test the authorization filters.",
+    "version": "1.0.7",
+    "title": "Swagger Petstore",
+    "termsOfService": "http://swagger.io/terms/",
+    "contact": {
+      "email": "apiteam@swagger.io"
+    },
+    "license": {
+      "name": "Apache 2.0",
+      "url": "http://www.apache.org/licenses/LICENSE-2.0.html"
+    }
   },
   "host": "petstore.swagger.io",
   "basePath": "/v2",
+  "tags": [
+    {
+      "name": "pet",
+      "description": "Everything about your Pets",
+      "externalDocs": {
+        "description": "Find out more",
+        "url": "http://swagger.io"
+      }
+    },
+    {
+      "name": "store",
+      "description": "Access to Petstore orders"
+    },
+    {
+      "name": "user",
+      "description": "Operations about user",
+      "externalDocs": {
+        "description": "Find out more about our store",
+        "url": "http://swagger.io"
+      }
+    }
+  ],
   "schemes": [
-    "https"
+    "https",
+    "http"
   ],
   "paths": {
+    "/pet/{petId}/uploadImage": {
+      "post": {
+        "tags": [
+          "pet"
+        ],
+        "summary": "uploads an image",
+        "description": "",
+        "operationId": "uploadFile",
+        "consumes": [
+          "multipart/form-data"
+        ],
+        "produces": [
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "name": "petId",
+            "in": "path",
+            "description": "ID of pet to update",
+            "required": true,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "additionalMetadata",
+            "in": "formData",
+            "description": "Additional data to pass to server",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "file",
+            "in": "formData",
+            "description": "file to upload",
+            "required": false,
+            "type": "file"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "type": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "petstore_auth": [
+              "write:pets",
+              "read:pets"
+            ]
+          }
+        ]
+      }
+    },
+    "/pet": {
+      "post": {
+        "tags": [
+          "pet"
+        ],
+        "summary": "Add a new pet to the store",
+        "description": "",
+        "operationId": "addPet",
+        "consumes": [
+          "application/json",
+          "application/xml"
+        ],
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "description": "Pet object that needs to be added to the store",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Pet"
+            }
+          }
+        ],
+        "responses": {
+          "405": {
+            "description": "Invalid input"
+          }
+        },
+        "security": [
+          {
+            "petstore_auth": [
+              "write:pets",
+              "read:pets"
+            ]
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "pet"
+        ],
+        "summary": "Update an existing pet",
+        "description": "",
+        "operationId": "updatePet",
+        "consumes": [
+          "application/json",
+          "application/xml"
+        ],
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "description": "Pet object that needs to be added to the store",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/Pet"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Invalid ID supplied"
+          },
+          "404": {
+            "description": "Pet not found"
+          },
+          "405": {
+            "description": "Validation exception"
+          }
+        },
+        "security": [
+          {
+            "petstore_auth": [
+              "write:pets",
+              "read:pets"
+            ]
+          }
+        ]
+      }
+    },
     "/pet/findByStatus": {
       "get": {
+        "tags": [
+          "pet"
+        ],
         "summary": "Finds Pets by status",
+        "description": "Multiple status values can be provided with comma separated strings",
         "operationId": "findPetsByStatus",
         "produces": [
-          "application/xml",
-          "application/json"
+          "application/json",
+          "application/xml"
         ],
         "parameters": [
           {
@@ -916,60 +1584,672 @@ if __name__ == "__main__":
         ],
         "responses": {
           "200": {
-            "description": "successful operation"
+            "description": "successful operation",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "photoUrls"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "category": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "xml": {
+                      "name": "Category"
+                    }
+                  },
+                  "name": {
+                    "type": "string",
+                    "example": "doggie"
+                  },
+                  "photoUrls": {
+                    "type": "array",
+                    "xml": {
+                      "wrapped": true
+                    },
+                    "items": {
+                      "type": "string",
+                      "xml": {
+                        "name": "photoUrl"
+                      }
+                    }
+                  },
+                  "tags": {
+                    "type": "array",
+                    "xml": {
+                      "wrapped": true
+                    },
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer",
+                          "format": "int64"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "xml": {
+                        "name": "Tag"
+                      }
+                    }
+                  },
+                  "status": {
+                    "type": "string",
+                    "description": "pet status in the store",
+                    "enum": [
+                      "available",
+                      "pending",
+                      "sold"
+                    ]
+                  }
+                },
+                "xml": {
+                  "name": "Pet"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid status value"
           }
-        }
+        },
+        "security": [
+          {
+            "petstore_auth": [
+              "write:pets",
+              "read:pets"
+            ]
+          }
+        ]
       }
     },
-    "/pet": {
-      "post": {
-        "summary": "Add a new pet to the store",
-        "operationId": "addPet",
-        "consumes": [
+    "/pet/findByTags": {
+      "get": {
+        "tags": [
+          "pet"
+        ],
+        "summary": "Finds Pets by tags",
+        "description": "Multiple tags can be provided with comma separated strings. Use tag1, tag2, tag3 for testing.",
+        "operationId": "findPetsByTags",
+        "produces": [
           "application/json",
           "application/xml"
         ],
+        "parameters": [
+          {
+            "name": "tags",
+            "in": "query",
+            "description": "Tags to filter by",
+            "required": true,
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "collectionFormat": "multi"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "photoUrls"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "category": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "xml": {
+                      "name": "Category"
+                    }
+                  },
+                  "name": {
+                    "type": "string",
+                    "example": "doggie"
+                  },
+                  "photoUrls": {
+                    "type": "array",
+                    "xml": {
+                      "wrapped": true
+                    },
+                    "items": {
+                      "type": "string",
+                      "xml": {
+                        "name": "photoUrl"
+                      }
+                    }
+                  },
+                  "tags": {
+                    "type": "array",
+                    "xml": {
+                      "wrapped": true
+                    },
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer",
+                          "format": "int64"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      },
+                      "xml": {
+                        "name": "Tag"
+                      }
+                    }
+                  },
+                  "status": {
+                    "type": "string",
+                    "description": "pet status in the store",
+                    "enum": [
+                      "available",
+                      "pending",
+                      "sold"
+                    ]
+                  }
+                },
+                "xml": {
+                  "name": "Pet"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid tag value"
+          }
+        },
+        "security": [
+          {
+            "petstore_auth": [
+              "write:pets",
+              "read:pets"
+            ]
+          }
+        ],
+        "deprecated": true
+      }
+    },
+    "/pet/{petId}": {
+      "get": {
+        "tags": [
+          "pet"
+        ],
+        "summary": "Find pet by ID",
+        "description": "Returns a single pet",
+        "operationId": "getPetById",
         "produces": [
-          "application/xml",
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "name": "petId",
+            "in": "path",
+            "description": "ID of pet to return",
+            "required": true,
+            "type": "integer",
+            "format": "int64"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "schema": {
+              "type": "object",
+              "required": [
+                "name",
+                "photoUrls"
+              ],
+              "properties": {
+                "id": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "category": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  },
+                  "xml": {
+                    "name": "Category"
+                  }
+                },
+                "name": {
+                  "type": "string",
+                  "example": "doggie"
+                },
+                "photoUrls": {
+                  "type": "array",
+                  "xml": {
+                    "wrapped": true
+                  },
+                  "items": {
+                    "type": "string",
+                    "xml": {
+                      "name": "photoUrl"
+                    }
+                  }
+                },
+                "tags": {
+                  "type": "array",
+                  "xml": {
+                    "wrapped": true
+                  },
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "xml": {
+                      "name": "Tag"
+                    }
+                  }
+                },
+                "status": {
+                  "type": "string",
+                  "description": "pet status in the store",
+                  "enum": [
+                    "available",
+                    "pending",
+                    "sold"
+                  ]
+                }
+              },
+              "xml": {
+                "name": "Pet"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid ID supplied"
+          },
+          "404": {
+            "description": "Pet not found"
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "pet"
+        ],
+        "summary": "Updates a pet in the store with form data",
+        "description": "",
+        "operationId": "updatePetWithForm",
+        "consumes": [
+          "application/x-www-form-urlencoded"
+        ],
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "name": "petId",
+            "in": "path",
+            "description": "ID of pet that needs to be updated",
+            "required": true,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "name",
+            "in": "formData",
+            "description": "Updated name of the pet",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "status",
+            "in": "formData",
+            "description": "Updated status of the pet",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "responses": {
+          "405": {
+            "description": "Invalid input"
+          }
+        },
+        "security": [
+          {
+            "petstore_auth": [
+              "write:pets",
+              "read:pets"
+            ]
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "pet"
+        ],
+        "summary": "Deletes a pet",
+        "description": "",
+        "operationId": "deletePet",
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "name": "api_key",
+            "in": "header",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "petId",
+            "in": "path",
+            "description": "Pet id to delete",
+            "required": true,
+            "type": "integer",
+            "format": "int64"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Invalid ID supplied"
+          },
+          "404": {
+            "description": "Pet not found"
+          }
+        },
+        "security": [
+          {
+            "petstore_auth": [
+              "write:pets",
+              "read:pets"
+            ]
+          }
+        ]
+      }
+    },
+    "/store/inventory": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Returns pet inventories by status",
+        "description": "Returns a map of status codes to quantities",
+        "operationId": "getInventory",
+        "produces": [
           "application/json"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "schema": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "format": "int32"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api_key": []
+          }
+        ]
+      }
+    },
+    "/store/order": {
+      "post": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Place an order for a pet",
+        "description": "",
+        "operationId": "placeOrder",
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/json",
+          "application/xml"
         ],
         "parameters": [
           {
             "in": "body",
             "name": "body",
-            "description": "Pet object that needs to be added to the store",
+            "description": "order placed for purchasing the pet",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/Pet"
+              "$ref": "#/definitions/Order"
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "successful operation"
+            "description": "successful operation",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "petId": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "quantity": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "shipDate": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "status": {
+                  "type": "string",
+                  "description": "Order Status",
+                  "enum": [
+                    "placed",
+                    "approved",
+                    "delivered"
+                  ]
+                },
+                "complete": {
+                  "type": "boolean"
+                }
+              },
+              "xml": {
+                "name": "Order"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid Order"
           }
         }
       }
     },
-    "/user": {
+    "/store/order/{orderId}": {
+      "get": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Find purchase order by ID",
+        "description": "For valid response try integer IDs with value >= 1 and <= 10. Other values will generated exceptions",
+        "operationId": "getOrderById",
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "name": "orderId",
+            "in": "path",
+            "description": "ID of pet that needs to be fetched",
+            "required": true,
+            "type": "integer",
+            "maximum": 10,
+            "minimum": 1,
+            "format": "int64"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "successful operation",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "petId": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "quantity": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "shipDate": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "status": {
+                  "type": "string",
+                  "description": "Order Status",
+                  "enum": [
+                    "placed",
+                    "approved",
+                    "delivered"
+                  ]
+                },
+                "complete": {
+                  "type": "boolean"
+                }
+              },
+              "xml": {
+                "name": "Order"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid ID supplied"
+          },
+          "404": {
+            "description": "Order not found"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "store"
+        ],
+        "summary": "Delete purchase order by ID",
+        "description": "For valid response try integer IDs with positive integer value. Negative or non-integer values will generate API errors",
+        "operationId": "deleteOrder",
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "name": "orderId",
+            "in": "path",
+            "description": "ID of the order that needs to be deleted",
+            "required": true,
+            "type": "integer",
+            "minimum": 1,
+            "format": "int64"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Invalid ID supplied"
+          },
+          "404": {
+            "description": "Order not found"
+          }
+        }
+      }
+    },
+    "/user/createWithList": {
       "post": {
-        "summary": "Create user",
-        "operationId": "createUser",
+        "tags": [
+          "user"
+        ],
+        "summary": "Creates list of users with given input array",
+        "description": "",
+        "operationId": "createUsersWithListInput",
         "consumes": [
           "application/json"
         ],
         "produces": [
-          "application/xml",
-          "application/json"
+          "application/json",
+          "application/xml"
         ],
         "parameters": [
           {
             "in": "body",
             "name": "body",
-            "description": "Created user object",
+            "description": "List of user object",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/User"
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/User"
+              }
             }
           }
         ],
@@ -980,71 +2260,87 @@ if __name__ == "__main__":
         }
       }
     },
-    "/user/login": {
-      "get": {
-        "summary": "Logs user into the system",
-        "operationId": "loginUser",
-        "produces": [
-          "application/xml",
-          "application/json"
-        ],
-        "parameters": [
-          {
-            "name": "username",
-            "in": "query",
-            "description": "The user name for login",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "password",
-            "in": "query",
-            "description": "The password for login in clear text",
-            "required": true,
-            "type": "string"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "successful operation"
-          }
-        }
-      }
-    },
     "/user/{username}": {
       "get": {
+        "tags": [
+          "user"
+        ],
         "summary": "Get user by user name",
+        "description": "",
         "operationId": "getUserByName",
         "produces": [
-          "application/xml",
-          "application/json"
+          "application/json",
+          "application/xml"
         ],
         "parameters": [
           {
             "name": "username",
             "in": "path",
-            "description": "The name that needs to be fetched. Use user1 for testing.",
+            "description": "The name that needs to be fetched. Use user1 for testing. ",
             "required": true,
             "type": "string"
           }
         ],
         "responses": {
           "200": {
-            "description": "successful operation"
+            "description": "successful operation",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "username": {
+                  "type": "string"
+                },
+                "firstName": {
+                  "type": "string"
+                },
+                "lastName": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": "string"
+                },
+                "password": {
+                  "type": "string"
+                },
+                "phone": {
+                  "type": "string"
+                },
+                "userStatus": {
+                  "type": "integer",
+                  "format": "int32",
+                  "description": "User Status"
+                }
+              },
+              "xml": {
+                "name": "User"
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid username supplied"
+          },
+          "404": {
+            "description": "User not found"
           }
         }
-      }
-    },
-    "/user/{username}": {
+      },
       "put": {
+        "tags": [
+          "user"
+        ],
         "summary": "Updated user",
+        "description": "This can only be done by the logged in user.",
         "operationId": "updateUser",
         "consumes": [
           "application/json"
         ],
         "produces": [
-          "application/xml",
-          "application/json"
+          "application/json",
+          "application/xml"
         ],
         "parameters": [
           {
@@ -1065,19 +2361,24 @@ if __name__ == "__main__":
           }
         ],
         "responses": {
-          "200": {
-            "description": "successful operation"
+          "400": {
+            "description": "Invalid user supplied"
+          },
+          "404": {
+            "description": "User not found"
           }
         }
-      }
-    },
-    "/user/{username}": {
+      },
       "delete": {
+        "tags": [
+          "user"
+        ],
         "summary": "Delete user",
+        "description": "This can only be done by the logged in user.",
         "operationId": "deleteUser",
         "produces": [
-          "application/xml",
-          "application/json"
+          "application/json",
+          "application/xml"
         ],
         "parameters": [
           {
@@ -1089,75 +2390,188 @@ if __name__ == "__main__":
           }
         ],
         "responses": {
+          "400": {
+            "description": "Invalid username supplied"
+          },
+          "404": {
+            "description": "User not found"
+          }
+        }
+      }
+    },
+    "/user/login": {
+      "get": {
+        "tags": [
+          "user"
+        ],
+        "summary": "Logs user into the system",
+        "description": "",
+        "operationId": "loginUser",
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "name": "username",
+            "in": "query",
+            "description": "The user name for login",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "password",
+            "in": "query",
+            "description": "The password for login in clear text",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "responses": {
           "200": {
+            "description": "successful operation",
+            "headers": {
+              "X-Expires-After": {
+                "type": "string",
+                "format": "date-time",
+                "description": "date in UTC when token expires"
+              },
+              "X-Rate-Limit": {
+                "type": "integer",
+                "format": "int32",
+                "description": "calls per hour allowed by the user"
+              }
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "400": {
+            "description": "Invalid username/password supplied"
+          }
+        }
+      }
+    },
+    "/user/logout": {
+      "get": {
+        "tags": [
+          "user"
+        ],
+        "summary": "Logs out current logged in user session",
+        "description": "",
+        "operationId": "logoutUser",
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [],
+        "responses": {
+          "default": {
+            "description": "successful operation"
+          }
+        }
+      }
+    },
+    "/user/createWithArray": {
+      "post": {
+        "tags": [
+          "user"
+        ],
+        "summary": "Creates list of users with given input array",
+        "description": "",
+        "operationId": "createUsersWithArrayInput",
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "description": "List of user object",
+            "required": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/User"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "successful operation"
+          }
+        }
+      }
+    },
+    "/user": {
+      "post": {
+        "tags": [
+          "user"
+        ],
+        "summary": "Create user",
+        "description": "This can only be done by the logged in user.",
+        "operationId": "createUser",
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/json",
+          "application/xml"
+        ],
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "description": "Created user object",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/User"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
             "description": "successful operation"
           }
         }
       }
     }
   },
-  "definitions": {
-    "User": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "type": "integer",
-          "format": "int64"
-        },
-        "username": {
-          "type": "string"
-        },
-        "email": {
-          "type": "string"
-        }
-      }
+  "securityDefinitions": {
+    "api_key": {
+      "type": "apiKey",
+      "name": "api_key",
+      "in": "header"
     },
-    "Pet": {
+    "petstore_auth": {
+      "type": "oauth2",
+      "authorizationUrl": "https://petstore.swagger.io/oauth/authorize",
+      "flow": "implicit",
+      "scopes": {
+        "read:pets": "read your pets",
+        "write:pets": "modify pets in your account"
+      }
+    }
+  },
+  "definitions": {
+    "ApiResponse": {
       "type": "object",
       "properties": {
-        "id": {
+        "code": {
           "type": "integer",
-          "format": "int64"
+          "format": "int32"
         },
-        "category": {
-          "$ref": "#/definitions/Category"
+        "type": {
+          "type": "string"
         },
-        "name": {
-          "type": "string",
-          "example": "doggie"
-        },
-        "photoUrls": {
-          "type": "array",
-          "xml": {
-            "name": "photoUrl",
-            "wrapped": true
-          },
-          "items": {
-            "type": "string"
-          }
-        },
-        "tags": {
-          "type": "array",
-          "xml": {
-            "name": "tag",
-            "wrapped": true
-          },
-          "items": {
-            "$ref": "#/definitions/Tag"
-          }
-        },
-        "status": {
-          "type": "string",
-          "description": "pet status in the store",
-          "enum": [
-            "available",
-            "pending",
-            "sold"
-          ]
+        "message": {
+          "type": "string"
         }
-      },
-      "xml": {
-        "name": "Pet"
       }
     },
     "Category": {
@@ -1175,6 +2589,83 @@ if __name__ == "__main__":
         "name": "Category"
       }
     },
+    "Pet": {
+      "type": "object",
+      "required": [
+        "name",
+        "photoUrls"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "category": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "xml": {
+            "name": "Category"
+          }
+        },
+        "name": {
+          "type": "string",
+          "example": "doggie"
+        },
+        "photoUrls": {
+          "type": "array",
+          "xml": {
+            "wrapped": true
+          },
+          "items": {
+            "type": "string",
+            "xml": {
+              "name": "photoUrl"
+            }
+          }
+        },
+        "tags": {
+          "type": "array",
+          "xml": {
+            "wrapped": true
+          },
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "xml": {
+              "name": "Tag"
+            }
+          }
+        },
+        "status": {
+          "type": "string",
+          "description": "pet status in the store",
+          "enum": [
+            "available",
+            "pending",
+            "sold"
+          ]
+        }
+      },
+      "xml": {
+        "name": "Pet"
+      }
+    },
     "Tag": {
       "type": "object",
       "properties": {
@@ -1189,7 +2680,82 @@ if __name__ == "__main__":
       "xml": {
         "name": "Tag"
       }
+    },
+    "Order": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "petId": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "quantity": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "shipDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "type": "string",
+          "description": "Order Status",
+          "enum": [
+            "placed",
+            "approved",
+            "delivered"
+          ]
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      },
+      "xml": {
+        "name": "Order"
+      }
+    },
+    "User": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "username": {
+          "type": "string"
+        },
+        "firstName": {
+          "type": "string"
+        },
+        "lastName": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "password": {
+          "type": "string"
+        },
+        "phone": {
+          "type": "string"
+        },
+        "userStatus": {
+          "type": "integer",
+          "format": "int32",
+          "description": "User Status"
+        }
+      },
+      "xml": {
+        "name": "User"
+      }
     }
+  },
+  "externalDocs": {
+    "description": "Find out more about Swagger",
+    "url": "http://swagger.io"
   }
 }
         """
@@ -1204,29 +2770,99 @@ if __name__ == "__main__":
             conn = sqlite3.connect(dummy_db_path)
             cursor = conn.cursor()
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS pets (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    tags TEXT
-                );
-            """)
+                           CREATE TABLE IF NOT EXISTS pets
+                           (
+                               id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               name
+                               TEXT
+                               NOT
+                               NULL,
+                               status
+                               TEXT
+                               NOT
+                               NULL,
+                               tags
+                               TEXT
+                           );
+                           """)
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    password TEXT NOT NULL,
-                    email TEXT
-                );
-            """)
-            cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Buddy', 'available', 'dog,friendly');")
-            cursor.execute("INSERT INTO pets (name, status, tags) VALUES ('Whiskers', 'pending', 'cat');")
-            cursor.execute("INSERT INTO users (username, password, email) VALUES ('testuser', 'testpass', 'test@example.com');")
+                           CREATE TABLE IF NOT EXISTS users
+                           (
+                               id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               username
+                               TEXT
+                               NOT
+                               NULL,
+                               password
+                               TEXT
+                               NOT
+                               NULL,
+                               email
+                               TEXT,
+                               role_id
+                               INTEGER
+                           );
+                           """)
+            cursor.execute("""
+                           CREATE TABLE IF NOT EXISTS orders
+                           (
+                               order_id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               user_id
+                               INTEGER,
+                               status
+                               TEXT
+                           );
+                           """)
+            cursor.execute("""
+                           CREATE TABLE IF NOT EXISTS inventory_items
+                           (
+                               item_id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               product_id
+                               INTEGER,
+                               quantity
+                               INTEGER
+                           );
+                           """)
+            cursor.execute("""
+                           CREATE TABLE IF NOT EXISTS roles
+                           (
+                               id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               role_name
+                               TEXT
+                           );
+                           """)
+            cursor.execute(
+                "INSERT INTO pets (id, name, status, tags) VALUES (1, 'Buddy', 'available', 'dog,friendly');")
+            cursor.execute("INSERT INTO pets (id, name, status, tags) VALUES (2, 'Whiskers', 'pending', 'cat');")
+            cursor.execute(
+                "INSERT INTO users (id, username, password, email, role_id) VALUES (101, 'testuser', 'testpass', 'test@example.com', 1);")
+            cursor.execute(
+                "INSERT INTO users (id, username, password, email, role_id) VALUES (102, 'user2', 'pass2', 'user2@example.com', 2);")
+            cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1001, 101, 'pending');")
+            cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1002, 102, 'completed');")
+            cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (1, 1, 50);")
+            cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (2, 2, 120);")
+            cursor.execute("INSERT INTO roles (id, role_name) VALUES (1, 'Admin');")
+            cursor.execute("INSERT INTO roles (id, role_name) VALUES (2, 'User');")
             conn.commit()
             conn.close()
             logger.info(f"Dummy SQLite database created at {dummy_db_path} with sample data.")
         except Exception as ex:
             logger.error(f"Error creating dummy DB during __main__ init: {ex}")
-
 
     main()
