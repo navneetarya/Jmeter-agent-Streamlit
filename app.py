@@ -220,6 +220,8 @@ def main():
         st.session_state.mapping_metadata_download = None
     if 'full_swagger_spec_download' not in st.session_state:  # New: for full swagger spec download
         st.session_state.full_swagger_spec_download = None
+    if 'enable_setup_teardown_thread_groups' not in st.session_state:
+        st.session_state.enable_setup_teardown_thread_groups = False
 
     # New Auth State
     if 'enable_auth_flow' not in st.session_state:
@@ -900,6 +902,14 @@ def main():
             help="e.g., Bearer "
         )
 
+    st.header("2.3 Scenario Thread Grouping")
+    st.session_state.enable_setup_teardown_thread_groups = st.checkbox(
+        "Enable Setup and Teardown Thread Groups",
+        value=st.session_state.enable_setup_teardown_thread_groups,
+        key="enable_setup_teardown_thread_groups_checkbox",
+        help="If checked, JMeter will generate separate Setup and Teardown Thread Groups for pre/post test actions."
+    )
+
     st.header("3. Select Endpoints for Scenario")
     if st.session_state.swagger_endpoints:
         endpoint_options = [f"{ep.method} {ep.path}" for ep in st.session_state.swagger_endpoints]
@@ -970,14 +980,23 @@ def main():
                         f"Login endpoint {st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path} not found in Swagger spec. Authentication flow might not work as expected.")
 
             # For selected endpoints in the main scenario
-            full_swagger_spec = st.session_state.swagger_parser.get_full_swagger_spec()
-            base_path_from_swagger = full_swagger_spec.get('basePath', '')
+            # Ensure full_swagger_spec is available here.
+            # This is where `full_swagger_spec` was used before it was assigned.
+            full_swagger_dict = st.session_state.swagger_parser.get_full_swagger_spec()
+
+            # Extract base path from the full swagger spec
+            base_path_from_swagger = full_swagger_dict.get('basePath', '/')
+            # Ensure base_path_from_swagger starts with '/' and does not end with '/' unless it's just '/'
+            if not base_path_from_swagger.startswith('/'):
+                base_path_from_swagger = '/' + base_path_from_swagger
+            if base_path_from_swagger != '/' and base_path_from_swagger.endswith('/'):
+                base_path_from_swagger = base_path_from_swagger.rstrip('/')
 
             for ep_key in selected_endpoint_keys:
                 method_str, path_str = ep_key.split(' ', 1)
                 method_key = method_str.lower()
 
-                resolved_endpoint_data = full_swagger_spec.get('paths', {}).get(path_str, {}).get(method_key, {})
+                resolved_endpoint_data = full_swagger_dict.get('paths', {}).get(path_str, {}).get(method_key, {})
 
                 if resolved_endpoint_data:
                     clean_path_name = re.sub(r'[^\w\s-]', '', path_str).replace('/', '_').strip('_')
@@ -987,7 +1006,7 @@ def main():
                     else:
                         request_name = f"{method_str}_{clean_path_name}"
 
-                    # Start with the raw path from Swagger
+                    # Start with the raw path from Swagger, which might contain path parameters {var}
                     jmeter_formatted_path = path_str
 
                     # Process path parameters and convert to JMeter variables
@@ -998,33 +1017,61 @@ def main():
 
                                 jmeter_var_for_path_param = f"${{{param_name}}}"  # Default fallback
 
-                                if param_name.lower() in extracted_variables_map:
+                                # Check for mapped values first (DB or static)
+                                mapping_info = st.session_state.mappings.get(ep_key, {}).get(param_name)
+                                if mapping_info:
+                                    # Ensure the value is formatted as a JMeter variable if it's from CSV
+                                    if mapping_info['source'] == "DB Sample (CSV)":
+                                        # DataMapper.suggest_mappings should already return CSV variables as ${csv_table_column}
+                                        jmeter_var_for_path_param = mapping_info['value']
+                                    elif mapping_info['source'] == "Generated Value":
+                                        # Generated values might directly be used or need JMeter function
+                                        jmeter_var_for_path_param = mapping_info['value']
+                                    else:  # For Static or direct values, ensure it's a string
+                                        jmeter_var_for_path_param = str(mapping_info['value'])
+                                    logger.debug(
+                                        f"Path param '{param_name}' for {ep_key} using mapping: {jmeter_var_for_path_param} (Source: {mapping_info['source']})")
+                                elif param_name.lower() in extracted_variables_map:
+                                    # Then check for extracted variables from previous responses
                                     jmeter_var_for_path_param = extracted_variables_map[param_name.lower()]
                                     logger.debug(
                                         f"Path param '{param_name}' for {ep_key} using extracted variable: {jmeter_var_for_path_param}")
                                 else:
-                                    mapping_info = st.session_state.mappings.get(ep_key, {}).get(param_name)
-                                    if mapping_info and mapping_info['source'] == "DB Sample (CSV)":
-                                        jmeter_var_for_path_param = mapping_info['value']
-                                        logger.debug(
-                                            f"Path param '{param_name}' for {ep_key} using CSV mapping: {jmeter_var_for_path_param}")
-                                    else:
-                                        logger.warning(
-                                            f"Path param '{param_name}' for {ep_key} has no explicit DB/extraction mapping. Using generic JMeter variable: {jmeter_var_for_path_param}")
+                                    # Fallback if no mapping or extraction found
+                                    logger.warning(
+                                        f"Path param '{param_name}' for {ep_key} has no explicit DB/extraction/static mapping. Using generic JMeter variable: {jmeter_var_for_path_param}")
 
-                                # Replace {paramName} with ${jmeterVarName}
-                                jmeter_formatted_path = jmeter_formatted_path.replace(f"{{{param_name}}}",
-                                                                                      jmeter_var_for_path_param)
+                                # Replace {paramName} with the determined JMeter variable or value
+                                # Use regex to handle cases where param_name might contain special chars or appear multiple times
+                                jmeter_formatted_path = re.sub(r'\{' + re.escape(param_name) + r'\}',
+                                                               jmeter_var_for_path_param, jmeter_formatted_path)
 
-                    # Prepend the base path from Swagger. Ensure no double slashes.
-                    final_request_path_for_jmeter = f"{base_path_from_swagger}{jmeter_formatted_path}"
-                    final_request_path_for_jmeter = final_request_path_for_jmeter.replace('//', '/')
+                    # The `HTTPSampler.path` in JMeter should NOT include the base path if the base path is defined in HTTP Request Defaults.
+                    # Given the request, we want `http_defaults_base_path` to handle `/v2`.
+                    # So, `request_path` should just be the endpoint's specific path (e.g., `/pet/{petId}`).
+                    # The `jmeter_generator`'s `add_http_request_defaults` will set `HTTPSampler.path` to `base_path_from_swagger`.
+                    # Thus, the `path` for individual samplers should be relative to that base path.
+                    final_request_path_for_jmeter = jmeter_formatted_path
+                    # If base_path_from_swagger is not '/' and the jmeter_formatted_path starts with base_path_from_swagger,
+                    # remove it to make the sampler path relative.
+                    if base_path_from_swagger != '/' and final_request_path_for_jmeter.startswith(
+                            base_path_from_swagger):
+                        final_request_path_for_jmeter = final_request_path_for_jmeter[len(base_path_from_swagger):]
+                        # Ensure it still starts with a '/' if it's not empty
+                        if not final_request_path_for_jmeter.startswith('/'):
+                            final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
+                        if final_request_path_for_jmeter == "//":  # Handle cases like /v2 followed by /
+                            final_request_path_for_jmeter = "/"
+
+                    # Ensure it always starts with / unless it's an empty path.
+                    if final_request_path_for_jmeter and not final_request_path_for_jmeter.startswith('/'):
+                        final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
 
                     request_config = {
                         "endpoint_key": ep_key,
                         "name": request_name,
                         "method": method_str,
-                        "path": final_request_path_for_jmeter,  # This is the crucial line
+                        "path": final_request_path_for_jmeter,  # This is the crucial line, now relative
                         "parameters": {},  # Query parameters are handled below
                         "headers": {},
                         "body": None,
@@ -1262,14 +1309,17 @@ def main():
             protocol = parsed_url.scheme
             domain = parsed_url.hostname
             port = parsed_url.port if parsed_url.port else ""
-            # basePath for Swagger 2.0 or just a path segment for OpenAPI 3.0
-            base_path = parsed_url.path.rsplit('/', 1)[0] if parsed_url.path.endswith(
-                '.json') or parsed_url.path.endswith('.yaml') else parsed_url.path
-            if not base_path:  # Ensure base_path is at least "/" if empty
-                base_path = "/"
 
-            # Use swagger_parser instance to get the full resolved spec
-            full_resolved_swagger_spec = st.session_state.swagger_parser.get_full_swagger_spec()
+            # Get the full swagger spec dictionary from the parser instance
+            current_full_swagger_spec_dict = st.session_state.swagger_parser.get_full_swagger_spec()
+
+            # This base_path is the one passed to the JMeterGenerator's HTTP Defaults,
+            # which expects the base path from the Swagger spec (e.g., /v2)
+            base_path_for_http_defaults = current_full_swagger_spec_dict.get('basePath', '/')
+            if not base_path_for_http_defaults.startswith('/'):
+                base_path_for_http_defaults = '/' + base_path_for_http_defaults
+            if base_path_for_http_defaults != '/' and base_path_for_http_defaults.endswith('/'):
+                base_path_for_http_defaults = base_path_for_http_defaults.rstrip('/')
 
             jmx_content, _ = generator.generate_jmx(
                 app_base_url=swagger_url,  # Original URL for consistency
@@ -1284,8 +1334,9 @@ def main():
                 http_defaults_protocol=protocol,
                 http_defaults_domain=domain,
                 http_defaults_port=port,
-                http_defaults_base_path=base_path,
-                full_swagger_spec=full_resolved_swagger_spec  # Pass the full resolved spec
+                http_defaults_base_path=base_path_for_http_defaults,  # Pass the resolved base path
+                full_swagger_spec=current_full_swagger_spec_dict,  # Pass the full resolved spec
+                enable_setup_teardown_thread_groups=st.session_state.enable_setup_teardown_thread_groups
             )
 
             st.session_state.jmx_content_download = jmx_content  # Store for persistence
@@ -2704,9 +2755,9 @@ if __name__ == "__main__":
           "type": "string",
           "description": "Order Status",
           "enum": [
-            "placed",
-            "approved",
-            "delivered"
+                    "placed",
+                    "approved",
+                    "delivered"
           ]
         },
         "complete": {
