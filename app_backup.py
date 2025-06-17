@@ -5,13 +5,13 @@ import sqlite3
 import pandas as pd
 from typing import Dict, List, Any, Optional
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field  # Keep dataclass and field for other @dataclass uses
 import os
 import sys
-import re
-from urllib.parse import urlparse
-import uuid
-import time
+import re  # Import regex module
+from urllib.parse import urlparse  # Import urlparse for parsing base URL
+import uuid  # For UUID generation
+import time  # For timestamp generation
 
 # FIX: Increase the string conversion limit for large integers.
 sys.set_int_max_str_digits(0)  # 0 means unlimited
@@ -19,13 +19,19 @@ sys.set_int_max_str_digits(0)  # 0 means unlimited
 # Add utils to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
 
+# Assuming these are available and correct from the 'utils' directory
 from utils.jmeter_generator import JMeterScriptGenerator
 from utils.database_connector import DatabaseConnector, DatabaseConfig
-from utils.swagger_parser import SwaggerParser, SwaggerEndpoint
-from utils.data_mapper import DataMapper
+from utils.swagger_parser import SwaggerParser, SwaggerEndpoint  # IMPORT from utils
+from utils.data_mapper import DataMapper  # Import DataMapper
 
+# Configure logging to DEBUG level for detailed output
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# SwaggerEndpoint and SwaggerParser classes are now imported from utils.swagger_parser
+# No local definition needed here anymore.
 
 
 def _clean_url_string(url_string: str) -> str:
@@ -60,165 +66,76 @@ def _clean_url_string(url_string: str) -> str:
 
 
 def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpoint],
-                               db_tables_schema: Dict[str, List[Dict[str, Any]]],  # Changed to Any for schema details
-                               db_sampled_data: Dict[str, pd.DataFrame],  # Added sampled data for LLM context
+                               db_tables_schema: Dict[str, List[Dict[str, str]]],
+                               existing_mappings: Dict[str, Dict[str, Any]],  # Changed type hint
                                thread_group_users: int,
                                ramp_up_time: int,
                                loop_count: int,
-                               api_key: str) -> Optional[
-    List[Dict[str, Any]]]:  # Now returns a list of scenario requests
+                               api_key: str) -> Dict[str, Any]:
     """
-    Calls an LLM to generate a detailed, structured test plan (scenario plan)
-    in JSON format, including parameter sourcing, assertions, and extractors.
+    Calls an LLM to generate a high-level test plan suggestion.
     """
 
     swagger_summary = []
     for ep in swagger_endpoints:
-        # Include full parameters and body schema for LLM
-        params_info = []
-        for p in ep.parameters:
-            param_detail = {"name": p.get('name'), "in": p.get('in'), "type": p.get('type'),
-                            "required": p.get('required', False)}
-            if 'enum' in p: param_detail['enum'] = p['enum']
-            if 'format' in p: param_detail['format'] = p['format']
-            if 'minimum' in p: param_detail['minimum'] = p['minimum']
-            if 'maximum' in p: param_detail['maximum'] = p['maximum']
-            if 'minLength' in p: param_detail['minLength'] = p['minLength']
-            if 'maxLength' in p: param_detail['maxLength'] = p['maxLength']
-            params_info.append(param_detail)
-
-        body_schema_info = ep.body_schema  # Pass the full body schema
-
-        swagger_summary.append({
-            "method": ep.method,
-            "path": ep.path,
-            "operationId": ep.operation_id,
-            "summary": ep.summary,
-            "parameters": params_info,
-            "body_schema": body_schema_info,
-            "responses": ep.responses  # Include full responses for extraction ideas
-        })
+        params_summary = ", ".join([p.get('name', '') for p in ep.parameters])
+        headers_summary = " (No specific headers)"
+        if ep.method == "POST" or ep.method == "PUT" or ep.method == "PATCH":
+            if ep.consumes:
+                headers_summary = f" (Common headers: Content-Type: {ep.consumes[0]})"
+            else:
+                headers_summary = " (Common headers: Content-Type: application/json)"
+        swagger_summary.append(f"{ep.method} {ep.path} (Parameters: {params_summary}){headers_summary}")
 
     db_schema_summary = {}
     for table_name, columns in db_tables_schema.items():
         column_details = []
         for col in columns:
-            column_details.append(col)  # Pass full column details including PK/FK
+            col_info = f"{col['name']} ({col['type']}"
+            if col.get('is_primary_key'):
+                col_info += ", PK"
+            if col.get('is_foreign_key'):
+                ref = col['references']
+                col_info += f", FK references {ref['ref_table']}.{ref['ref_column']}"
+            col_info += ")"
+            column_details.append(col_info)
         db_schema_summary[table_name] = column_details
 
-    # Also provide a summary of sampled data for LLM to understand what's available
-    sampled_data_summary = {}
-    for table_name, df in db_sampled_data.items():
-        if not df.empty:
-            # Create a copy to avoid SettingWithCopyWarning
-            temp_df = df.head(2).copy()
-
-            # Convert Timestamp objects to string
-            for col in temp_df.select_dtypes(include=['datetime64[ns]']).columns:
-                temp_df[col] = temp_df[col].apply(lambda x: x.isoformat() if pd.notna(x) else None)
-
-            # Convert bytes objects to string representation
-            for col in temp_df.columns:
-                if temp_df[col].apply(lambda x: isinstance(x, bytes)).any():
-                    temp_df[col] = temp_df[col].apply(
-                        lambda x: x.decode('utf-8', errors='ignore') if isinstance(x, bytes) else x)
-
-            sampled_data_summary[table_name] = temp_df.to_dict(orient='records')  # Just 2 rows for example
-        else:
-            sampled_data_summary[table_name] = "No sampled data"
+    sanitized_prompt = json.dumps(prompt)
 
     llm_prompt = f"""
     You are an expert in performance testing and JMeter script generation.
-    Your task is to design a detailed test scenario plan in JSON format.
-    This plan should directly specify each API request, how its parameters and body fields are sourced (from CSV, from previous extractions, generated dummy data, or static values),
-    what assertions should be applied, and what values should be extracted from responses.
+    Your task is to propose a high-level test plan suggestion based on the user's request,
+    Swagger API endpoints, and a detailed database schema. This proposal will be used
+    to guide the user in setting up their test scenario in a UI.
 
-    User's test scenario request: {prompt}
+    User's test scenario request: {sanitized_prompt}
 
-    Available Swagger Endpoints (with full parameter and body schemas, and response schemas):
+    Available Swagger Endpoints:
     {json.dumps(swagger_summary, indent=2)}
 
-    Detailed Database Schema (includes column names, types, nullability, primary key status, and foreign key references):
+    Database Schema (includes Primary and Foreign Key information for each column):
     {json.dumps(db_schema_summary, indent=2)}
 
-    Sampled Database Data (first 2 rows for each table, if available):
-    {json.dumps(sampled_data_summary, indent=2)}
+    Existing Data Mappings (parameter -> source: "...", value: "..."):
+    {json.dumps(existing_mappings, indent=2)}
 
-    Current Application Settings:
+    Thread Group Configuration (proposed):
     - Number of Users: {thread_group_users}
     - Ramp-up Time (seconds): {ramp_up_time}
-    - Loop Count: {loop_count} (Use -1 for infinite)
-    - Authentication Enabled: {st.session_state.enable_auth_flow}
-    - Login Endpoint Path: {st.session_state.auth_login_endpoint_path}
-    - Auth Token JSON Path: {st.session_state.auth_token_json_path}
-    - Auth Header Name: {st.session_state.auth_header_name}
-    - Auth Header Prefix: {st.session_state.auth_header_prefix}
+    - Loop Count: {loop_count}
 
-    Design the test scenario as a JSON array of request objects. Each request object must follow this structure:
-    ```json
-    [
-      {{
-        "name": "Login_User", // A descriptive name for the JMeter request
-        "method": "POST",
-        "path": "/user/login", // The exact API path as in Swagger. Use /user/login if it's the login endpoint. For others use their specific paths.
-        "description": "User login to obtain an authentication token.",
-        "parameters_and_body_fields": [
-          {{ "name": "username", "in": "body", "source": "from_csv", "table_name": "users", "column_name": "username", "type": "string" }},
-          {{ "name": "password", "in": "body", "source": "from_csv", "table_name": "users", "column_name": "password", "type": "string" }}
-        ],
-        "assertions": [
-          {{ "type": "Response Code", "value": "200" }}
-        ],
-        "extractions": [
-          {{ "json_path": "{st.session_state.auth_token_json_path}", "var_name": "authToken" }}
-        ],
-        "think_time_ms": 500
-      }},
-      {{
-        "name": "Get_Pet_By_ID",
-        "method": "GET",
-        "path": "/pet/{{petId}}", // Use {{paramName}} for path parameters.
-        "description": "Fetch pet details using an ID.",
-        "parameters_and_body_fields": [
-          {{ "name": "petId", "in": "path", "source": "from_csv", "table_name": "pets", "column_name": "id", "type": "integer", "format": "int64" }},
-          {{ "name": "{st.session_state.auth_header_name}", "in": "header", "source": "from_extraction", "source_request_name": "Login_User", "extracted_variable_name": "authToken", "prefix": "{st.session_state.auth_header_prefix}" }}
-        ],
-        "assertions": [
-          {{ "type": "Response Code", "value": "200" }},
-          {{ "type": "Response Body Contains", "value": "\"name\":" }}
-        ],
-        "extractions": [
-          {{ "json_path": "$.status", "var_name": "PetStatus" }}
-        ],
-        "think_time_ms": 100
-      }}
-      // Add more request objects as needed based on the user's request and available APIs/DB schema
-    ]
-    ```
+    Based on the user's request and the detailed schema, provide a concise, high-level summary of
+    a suggested test flow. Emphasize how database relationships (PK/FK) might be leveraged for data correlation
+    or generation (e.g., "Use user IDs from 'users' table (PK) to fetch orders from 'orders' table (FK)").
+    Do not generate the full detailed JSON scenario plan.
+    Instead, focus on suggesting:
+    1.  Which key API endpoints should be included.
+    2.  A logical sequence for these endpoints.
+    3.  Any crucial parameters that might need mapping or dynamic generation, specifically mentioning PK/FK relevance.
+    4.  General advice on assertions or correlation needed, considering database relationships.
 
-    For each `parameters_and_body_fields` item:
-    - `name`: Name of the parameter (e.g., 'petId', 'username', 'status', 'Authorization'). For body fields in a JSON object, use the top-level property name. For nested body fields, use dot notation (e.g., 'user.address.street').
-    - `in`: `path`, `query`, `header`, `body`.
-    - `source`:
-        - `from_csv`: Use data from a CSV file (derived from database sample). Requires `table_name` and `column_name`.
-        - `from_extraction`: Use a variable extracted from a previous response. Requires `source_request_name` (name of the request that performs the extraction, e.g., "Login_User") and `extracted_variable_name` (JMeter variable name, e.g., "authToken"). You can also specify a `prefix` (e.g., "Bearer ").
-        - `generate_dummy`: Generate a dummy value. It's helpful to include original Swagger `type`, `format`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength` for smarter generation.
-        - `static_value`: Use a fixed literal value. Requires `value` field.
-    - `type`, `format`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`: These fields from Swagger parameter/schema definitions should be included for `generate_dummy` source types to inform better dummy data generation.
-
-    Consider the following when generating the plan:
-    - If authentication is enabled, always include a login request as the first step, and ensure subsequent requests include the authorization header sourced from the login response.
-    - Prioritize using `from_csv` for parameters that seem to map directly to database columns and whose data is available in the `Sampled Database Data`. **For `from_csv` source, ALWAYS provide `table_name` and `column_name` from the `Detailed Database Schema`.**
-    - Prioritize `from_extraction` for parameters that are likely to be correlated from previous API responses (e.g., IDs generated by a POST request and used in a subsequent GET/PUT/DELETE). **For `from_extraction` source, ALWAYS provide `source_request_name` and `extracted_variable_name`.**
-    - Use `generate_dummy` for fields where dynamic, but not necessarily real, data is needed.
-    - Use `static_value` for fixed parameters (e.g., specific status values from an enum).
-    - Ensure a `Content-Type` header is added for POST/PUT/PATCH requests where a body is sent.
-    - Add meaningful `assertions` (e.g., 200 OK, or body content relevant to success).
-    - Add relevant `extractions` for IDs or tokens from successful responses for later correlation.
-    - Provide reasonable `think_time_ms` for each step.
-    - The `path` for a request should be the raw Swagger path, with `{{paramName}}` placeholders for path parameters, as the logic will replace these with JMeter variables.
-
-    Your response MUST be ONLY the JSON array described above, with no additional text, markdown, or conversational elements.
+    Respond in markdown format. Start with "Suggested Test Flow:"
     """
 
     protocol_segment = "https://"
@@ -231,72 +148,6 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
 
     payload = {
         "contents": [{"role": "user", "parts": [{"text": llm_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "name": {"type": "STRING"},
-                        "method": {"type": "STRING", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
-                        "path": {"type": "STRING"},
-                        "description": {"type": "STRING"},
-                        "parameters_and_body_fields": {
-                            "type": "ARRAY",
-                            "items": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "name": {"type": "STRING"},
-                                    "in": {"type": "STRING", "enum": ["path", "query", "header", "body"]},
-                                    "source": {"type": "STRING",
-                                               "enum": ["from_csv", "from_extraction", "generate_dummy",
-                                                        "static_value"]},
-                                    "table_name": {"type": "STRING"},
-                                    "column_name": {"type": "STRING"},
-                                    "source_request_name": {"type": "STRING"},
-                                    "extracted_variable_name": {"type": "STRING"},
-                                    "value": {"type": "STRING"},
-                                    "prefix": {"type": "STRING"},
-                                    "type": {"type": "STRING"},  # Original Swagger type
-                                    "format": {"type": "STRING"},  # Original Swagger format
-                                    "enum": {"type": "ARRAY", "items": {"type": "STRING"}},
-                                    "minimum": {"type": "NUMBER"},
-                                    "maximum": {"type": "NUMBER"},
-                                    "minLength": {"type": "INTEGER"},
-                                    "maxLength": {"type": "INTEGER"}
-                                },
-                                "required": ["name", "in", "source"]
-                            }
-                        },
-                        "assertions": {
-                            "type": "ARRAY",
-                            "items": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "type": {"type": "STRING", "enum": ["Response Code", "Response Body Contains"]},
-                                    "value": {"type": "STRING"}
-                                },
-                                "required": ["type", "value"]
-                            }
-                        },
-                        "extractions": {
-                            "type": "ARRAY",
-                            "items": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "json_path": {"type": "STRING"},
-                                    "var_name": {"type": "STRING"}
-                                },
-                                "required": ["json_path", "var_name"]
-                            }
-                        },
-                        "think_time_ms": {"type": "INTEGER"}
-                    },
-                    "required": ["name", "method", "path"]
-                }
-            }
-        }
     }
 
     try:
@@ -304,35 +155,13 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
         response.raise_for_status()
         result = response.json()
 
-        # Check if result structure is as expected and parse the JSON string
         if result.get('candidates') and len(result['candidates']) > 0 and \
                 result['candidates'][0].get('content') and result['candidates'][0]['content'].get('parts') and \
                 len(result['candidates'][0]['content']['parts']) > 0:
-
-            json_response_str = result['candidates'][0]['content']['parts'][0]['text']
-            logger.info(f"Raw LLM JSON response before cleanup: {json_response_str}")  # Log before cleanup
-
-            # Attempt to clean up the response string: remove markdown code block fences
-            if json_response_str.strip().startswith("```json"):
-                json_response_str = json_response_str.strip()[len("```json"):].strip()
-                if json_response_str.strip().endswith("```"):
-                    json_response_str = json_response_str.strip()[:-len("```")].strip()
-
-            try:
-                parsed_json = json.loads(json_response_str)
-                logger.info(f"Successfully parsed LLM JSON response.")
-                return parsed_json
-            except json.JSONDecodeError as e:
-                st.error(
-                    f"Failed to parse LLM's JSON response after cleanup. This indicates an issue with the LLM's output format. Error: {e}")
-                st.code(
-                    f"Problematic JSON string (after attempted cleanup):\n{json_response_str}")  # Show the problematic string to the user
-                logger.error(
-                    f"JSON parsing error after cleanup from LLM response: {e}. Raw response after cleanup: {json_response_str}")
-                return None
+            return {"suggestion": result['candidates'][0]['content']['parts'][0]['text']}
         else:
-            logger.error(f"LLM did not return a valid structured suggestion: {result}")
-            return None
+            logger.error(f"LLM did not return a valid suggestion structure: {result}")
+            return {"suggestion": "Could not generate a specific suggestion at this time."}
     except requests.exceptions.RequestException as e:
         error_message = f"Error calling LLM API for suggestion: {e}. "
         if e.response is not None:
@@ -343,11 +172,11 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
                 error_message += f"Raw API Error Text: {e.response.text}"
         st.error(f"An error occurred while getting AI suggestion: {error_message}")
         logger.error(error_message)
-        return None
+        return {"suggestion": f"An error occurred while getting AI suggestion: {e}"}
     except Exception as e:
         st.error(f"An unexpected error occurred during LLM call for suggestion: {e}")
         logger.error(f"An unexpected error occurred: {e}")
-        return None
+        return {"suggestion": f"An unexpected error occurred: {e}"}
 
 
 def main():
@@ -365,9 +194,9 @@ def main():
         st.session_state.swagger_endpoints = []
     if 'db_tables' not in st.session_state:
         st.session_state.db_tables = []
-    if 'db_sampled_data' not in st.session_state:
+    if 'db_sampled_data' not in st.session_state:  # New: Store sampled data
         st.session_state.db_sampled_data = {}
-    if 'mappings' not in st.session_state:
+    if 'mappings' not in st.session_state:  # Stores detailed mapping info
         st.session_state.mappings = {}
     if 'db_connector' not in st.session_state:
         st.session_state.db_connector = None
@@ -381,44 +210,43 @@ def main():
         st.session_state.selected_endpoint_keys = []
     if 'scenario_requests_configs' not in st.session_state:
         st.session_state.scenario_requests_configs = []
-    if 'llm_structured_scenario' not in st.session_state:  # Renamed from llm_suggestion
-        st.session_state.llm_structured_scenario = None
-    if 'llm_text_suggestion' not in st.session_state:  # To display human-readable part
-        st.session_state.llm_text_suggestion = ""
+    if 'llm_suggestion' not in st.session_state:
+        st.session_state.llm_suggestion = ""
     if 'enable_constant_timer' not in st.session_state:
         st.session_state.enable_constant_timer = False
     if 'constant_timer_delay_ms' not in st.session_state:
-        st.session_state.constant_timer_delay_ms = 300
+        st.session_state.constant_timer_delay_ms = 300  # Default to 300 ms
     if 'include_scenario_assertions' not in st.session_state:
-        st.session_state.include_scenario_assertions = True
+        st.session_state.include_scenario_assertions = True  # Default to True
     if 'test_plan_name' not in st.session_state:
-        st.session_state.test_plan_name = "Web Application Performance Test"
+        st.session_state.test_plan_name = "Web Application Performance Test"  # Default
     if 'thread_group_name' not in st.session_state:
-        st.session_state.thread_group_name = "Users"
+        st.session_state.thread_group_name = "Users"  # Default
     if 'select_all_endpoints' not in st.session_state:
-        st.session_state.select_all_endpoints = False
-    if 'jmx_content_download' not in st.session_state:
+        st.session_state.select_all_endpoints = False  # New: for select all checkbox
+    if 'jmx_content_download' not in st.session_state:  # New: for persistent download
         st.session_state.jmx_content_download = None
-    if 'csv_content_download' not in st.session_state:
+    if 'csv_content_download' not in st.session_state:  # New: for persistent download
         st.session_state.csv_content_download = None
-    if 'mapping_metadata_download' not in st.session_state:
+    if 'mapping_metadata_download' not in st.session_state:  # New: for mapping metadata
         st.session_state.mapping_metadata_download = None
-    if 'full_swagger_spec_download' not in st.session_state:
+    if 'full_swagger_spec_download' not in st.session_state:  # New: for full swagger spec download
         st.session_state.full_swagger_spec_download = None
     if 'enable_setup_teardown_thread_groups' not in st.session_state:
         st.session_state.enable_setup_teardown_thread_groups = False
 
+    # New Auth State
     if 'enable_auth_flow' not in st.session_state:
         st.session_state.enable_auth_flow = False
     if 'auth_login_endpoint_path' not in st.session_state:
-        st.session_state.auth_login_endpoint_path = "/user/login"
+        st.session_state.auth_login_endpoint_path = "/user/login"  # Updated example
     if 'auth_login_method' not in st.session_state:
         st.session_state.auth_login_method = "POST"
-    if 'auth_login_username_param' not in st.session_state:
+    if 'auth_login_username_param' not in st.session_state:  # For dynamic login
         st.session_state.auth_login_username_param = "username"
-    if 'auth_login_password_param' not in st.session_state:
+    if 'auth_login_password_param' not in st.session_state:  # For dynamic login
         st.session_state.auth_login_password_param = "password"
-    if 'auth_login_body_template' not in st.session_state:
+    if 'auth_login_body_template' not in st.session_state:  # Use template for dynamic body
         st.session_state.auth_login_body_template = '{"username": "${csv_users_username}", "password": "${csv_users_password}"}'
     if 'auth_token_json_path' not in st.session_state:
         st.session_state.auth_token_json_path = "$.access_token"
@@ -427,6 +255,7 @@ def main():
     if 'auth_header_prefix' not in st.session_state:
         st.session_state.auth_header_prefix = "Bearer "
 
+    # Database connection parameters for MySQL/PostgreSQL/SQL Server
     if 'db_host' not in st.session_state:
         st.session_state.db_host = ""
     if 'db_user' not in st.session_state:
@@ -436,146 +265,133 @@ def main():
     if 'db_name' not in st.session_state:
         st.session_state.db_name = ""
     if 'db_port' not in st.session_state:
-        st.session_state.db_port = ""
-    if 'db_type_selected' not in st.session_state:
-        st.session_state.db_type_selected = "SQLite"
+        st.session_state.db_port = ""  # New: for database port
+    if 'db_type_selected' not in st.session_state:  # Keep track of selected DB type
+        st.session_state.db_type_selected = "SQLite"  # Default
 
+    # New: Initialize loop_count_input_specific
     if 'loop_count_input_specific' not in st.session_state:
-        st.session_state.loop_count_input_specific = 1
+        st.session_state.loop_count_input_specific = 1  # Default value
 
-    # Helper function to recursively build JSON body based on schema and LLM-suggested mappings
-    def _build_recursive_json_body_with_llm_guidance(
-            schema: Dict[str, Any],
-            llm_param_fields: List[Dict[str, Any]],  # LLM's suggested parameter/body field sourcing
-            current_path_segments: List[str],
-            extracted_vars: Dict[str, str],  # Already JMeter variable format
-            endpoint_key: str  # For DataMapper calls if needed
-    ) -> Any:
+    # Helper function to recursively build JSON body based on schema and mappings
+    def _build_recursive_json_body(schema: Dict[str, Any], endpoint_key: str,
+                                   current_path_segments: List[str],
+                                   extracted_vars: Dict[str, str]) -> Any:
         """
         Recursively builds a JSON body (or part of it) based on schema definitions,
-        prioritizing LLM-suggested sourcing strategies and integrating extracted variables
-        and DataMapper for CSV/dummy generation.
+        integrating mappings and extracted variables.
+        Ensures required fields are populated with appropriate dummy values if no specific mapping exists.
         """
         logger.debug(
-            f"Entering _build_recursive_json_body_with_llm_guidance for path: {'.'.join(current_path_segments)}, schema_type: {schema.get('type')}")
+            f"Entering _build_recursive_json_body for path: {'.'.join(current_path_segments)}, schema: {schema}")
 
         if not isinstance(schema, dict):
             logger.debug(f"Schema is not a dictionary: {schema}. Returning as is.")
             return schema
 
         schema_type = schema.get('type', 'object')
+        required_properties = schema.get('required', [])  # Get list of required properties
 
         if schema_type == 'object':
             body_obj = {}
             properties = schema.get('properties', {})
 
+            # Iterate through all properties defined in the schema
             for prop_name, prop_details in properties.items():
-                full_param_name_dot_path = ".".join(current_path_segments + [prop_name])
+                full_param_name = ".".join(current_path_segments + [prop_name])
 
-                # Find LLM's explicit instruction for this specific field
-                # For body fields, the 'name' in LLM instruction should match the full_param_name_dot_path
-                llm_instruction = next((item for item in llm_param_fields if
-                                        item.get('name') == full_param_name_dot_path and item.get('in') == 'body'),
-                                       None)
+                # Priority 1: Extracted variables from previous responses
+                if prop_name.lower() in extracted_vars:
+                    body_obj[prop_name] = extracted_vars[prop_name.lower()]
+                    logger.debug(
+                        f"Prop '{full_param_name}' populated from extracted var: {extracted_vars[prop_name.lower()]}")
+                    continue
 
-                value_set = False
+                # Priority 2: Explicit mappings from DataMapper (DB, Generated, Static)
+                mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(full_param_name)
 
-                if llm_instruction:
-                    source = llm_instruction.get("source")
-                    if source == "from_csv":
-                        table_name = llm_instruction.get("table_name")
-                        column_name = llm_instruction.get("column_name")
-                        if table_name and column_name:
-                            jmeter_var = f"${{csv_{table_name}_{column_name}}}"
-                            body_obj[prop_name] = jmeter_var
-                            value_set = True
-                            logger.debug(
-                                f"Body field '{full_param_name_dot_path}' populated from LLM CSV instruction: {jmeter_var}")
-                    elif source == "from_extraction":
-                        extracted_var_name = llm_instruction.get("extracted_variable_name")
-                        prefix = llm_instruction.get("prefix", "")
-                        if extracted_var_name in extracted_vars:  # Check if the extracted variable is available
-                            resolved_value = f"{prefix}{extracted_vars[extracted_var_name]}"
-                            body_obj[prop_name] = resolved_value
-                            value_set = True
-                            logger.debug(
-                                f"Body field '{full_param_name_dot_path}' populated from LLM extraction instruction: {resolved_value}")
+                if mapping_info:
+                    # For CSV variables or generated functions, embed as string literal for JMeter to resolve
+                    if isinstance(mapping_info['value'], str) and mapping_info['value'].startswith("${") and \
+                            mapping_info['value'].endswith("}"):
+                        body_obj[prop_name] = mapping_info['value']
+                        logger.debug(
+                            f"Prop '{full_param_name}' populated from mapping (JMeter var): {mapping_info['value']}")
+                    else:  # Directly use the mapped value, attempt type conversion if needed
+                        target_type = prop_details.get('type', mapping_info.get('type', 'string'))
+                        if target_type == 'integer':
+                            try:
+                                body_obj[prop_name] = int(mapping_info['value'])
+                            except (ValueError, TypeError):
+                                body_obj[prop_name] = mapping_info['value']
+                        elif target_type == 'boolean':
+                            body_obj[prop_name] = str(mapping_info['value']).lower() == 'true'
                         else:
-                            # Fallback to a placeholder or dummy if extraction source not found
-                            logger.warning(
-                                f"LLM suggested 'from_extraction' for {param_name} but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
-                            body_obj[prop_name] = DataMapper._generate_dummy_value(
-                                param_field)  # Use param_field as it contains schema details
-                            value_set = True
-                    elif source == "static_value":
-                        body_obj[prop_name] = llm_instruction.get("value")
-                        value_set = True
+                            body_obj[prop_name] = mapping_info['value']
                         logger.debug(
-                            f"Body field '{full_param_name_dot_path}' populated from LLM static instruction: {llm_instruction.get('value')}")
-                    elif source == "generate_dummy":
-                        body_obj[prop_name] = DataMapper._generate_dummy_value(
-                            llm_instruction)  # Pass LLM instruction which has swagger details
-                        value_set = True
-                        logger.debug(
-                            f"Body field '{full_param_name_dot_path}' populated from LLM dummy instruction: {body_obj[prop_name]}")
+                            f"Prop '{full_param_name}' populated from mapping (direct value): {mapping_info['value']}")
+                    continue  # Move to next property after populating from mapping
 
-                # If LLM didn't provide specific instruction or it failed, fall back
-                if not value_set:
-                    # Recursively build for nested objects/arrays
-                    if prop_details.get('type') == 'object':
-                        body_obj[prop_name] = _build_recursive_json_body_with_llm_guidance(
-                            prop_details, llm_param_fields, current_path_segments + [prop_name], extracted_vars,
-                            endpoint_key
-                        )
-                        logger.debug(f"Body field '{full_param_name_dot_path}' populated by recursive call (object).")
-                    elif prop_details.get('type') == 'array':
-                        if 'items' in prop_details:
-                            array_item_path_segments = current_path_segments + [prop_name, "_item"]
+                # Priority 3: Recursively build for nested objects/arrays, or generate dummy for required primitives
+                if prop_details.get('type') == 'object':
+                    body_obj[prop_name] = _build_recursive_json_body(
+                        prop_details, endpoint_key, current_path_segments + [prop_name], extracted_vars
+                    )
+                    logger.debug(f"Prop '{full_param_name}' populated by recursive call (object).")
+                elif prop_details.get('type') == 'array':
+                    if 'items' in prop_details:
+                        array_item_path_segments = current_path_segments + [prop_name, "_item"]
+                        item_mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(
+                            ".".join(array_item_path_segments[:-1]))
 
-                            item_schema = prop_details['items']  # Get the schema for array items
-
-                            generated_item = _build_recursive_json_body_with_llm_guidance(
-                                item_schema, llm_param_fields, array_item_path_segments, extracted_vars, endpoint_key
-                            )
-                            body_obj[prop_name] = [generated_item]  # Generate one item for the array as a sample
-                            logger.debug(
-                                f"Body field '{full_param_name_dot_path}' (array) populated with one recursive item: {body_obj[prop_name]}")
+                        if item_mapping_info and isinstance(item_mapping_info['value'], list):
+                            body_obj[prop_name] = item_mapping_info['value']
+                            logger.debug(f"Prop '{full_param_name}' (array) populated from explicit list mapping.")
                         else:
-                            body_obj[prop_name] = []  # Empty array if no items schema
-                            logger.debug(
-                                f"Body field '{full_param_name_dot_path}' (array) populated as empty (no item schema).")
-                    else:  # Primitive type (string, integer, boolean, number etc.)
-                        # Fallback to DataMapper's default dummy generation if no LLM instruction or other source
-                        body_obj[prop_name] = DataMapper._generate_dummy_value(
-                            prop_details)  # Pass prop_details for smarter dummy generation
-                        logger.debug(
-                            f"Body field '{full_param_name_dot_path}' (primitive, fallback) populated with dummy: {body_obj[prop_name]}")
+                            # Generate one item for the array as a sample
+                            body_obj[prop_name] = [_build_recursive_json_body(
+                                prop_details['items'], endpoint_key, array_item_path_segments, extracted_vars
+                            )]
+                            logger.debug(f"Prop '{full_param_name}' (array) populated by recursive call for item.")
+                    else:
+                        body_obj[prop_name] = []  # Empty array if no items schema
+                        logger.debug(f"Prop '{full_param_name}' (array) populated as empty (no item schema).")
+                else:  # Primitive type (string, integer, boolean, number etc.)
+                    # Always assign a dummy value if not populated by extracted vars or explicit mappings,
+                    # to ensure complete request body for required objects/parameters.
+                    prop_type = prop_details.get('type', 'string')
+                    if prop_type == 'string':
+                        body_obj[prop_name] = f"dummy_{prop_name}"
+                    elif prop_type == 'integer':
+                        body_obj[prop_name] = 789
+                    elif prop_type == 'boolean':
+                        body_obj[prop_name] = True
+                    elif prop_type == 'number':
+                        body_obj[prop_name] = 789.0
+                    else:
+                        body_obj[prop_name] = "<<UNSUPPORTED_PRIMITIVE_TYPE>>"
+                    logger.debug(
+                        f"Prop '{full_param_name}' (primitive, no mapping) populated with dummy: {body_obj[prop_name]}")
 
             return body_obj
 
         elif schema_type == 'array':
             logger.debug(f"Schema is an array. Path: {'.'.join(current_path_segments)}")
-            # Find LLM's explicit instruction for the root array itself (if body is an array)
-            root_array_full_path = ".".join(current_path_segments)
-            llm_instruction = next((item for item in llm_param_fields if
-                                    item.get('name') == root_array_full_path and item.get('in') == 'body'), None)
-
-            if llm_instruction and llm_instruction.get("source") == "static_value":
-                try:
-                    return json.loads(
-                        llm_instruction.get("value"))  # Assume static value for array is a JSON string of array
-                except json.JSONDecodeError:
-                    logger.warning(
-                        f"Static value for array body at {root_array_full_path} is not valid JSON array: {llm_instruction.get('value')}")
-                    return []
-
             if 'items' in schema:
-                # Generate a single item for the array as a sample based on its item schema
-                generated_item = _build_recursive_json_body_with_llm_guidance(
-                    schema['items'], llm_param_fields, current_path_segments + ["_item"], extracted_vars, endpoint_key
-                )
-                logger.debug(f"Root array body populated with one recursive item: {generated_item}")
-                return [generated_item]
+                # Check for a direct mapping of the root array (e.g., if the entire body is mapped to a CSV variable for an array)
+                root_array_mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(
+                    ".".join(current_path_segments))
+                if root_array_mapping_info and isinstance(root_array_mapping_info['value'], list):
+                    logger.debug(
+                        f"Root array body populated from explicit list mapping: {root_array_mapping_info['value']}")
+                    return root_array_mapping_info['value']
+                else:
+                    # Generate a single item for the array as a sample based on its item schema
+                    generated_item = _build_recursive_json_body(
+                        schema['items'], endpoint_key, current_path_segments + ["_item"], extracted_vars
+                    )
+                    logger.debug(f"Root array body populated with one recursive item: {generated_item}")
+                    return [generated_item]
             else:
                 logger.debug("Root array body populated as empty (no item schema).")
                 return []
@@ -583,49 +399,34 @@ def main():
                 # Handle primitive types directly at the current level (e.g., if body is just a string or integer)
         elif schema_type in ['string', 'integer', 'boolean', 'number']:
             logger.debug(f"Schema is a primitive type: {schema_type}. Path: {'.'.join(current_path_segments)}")
-            # For root-level primitive body, LLM instruction's name should match current_path_segments (empty string for root)
-            root_primitive_name = ".".join(
-                current_path_segments) if current_path_segments else ""  # For root body, name ""
-            llm_instruction = next((item for item in llm_param_fields if
-                                    item.get('name') == root_primitive_name and item.get('in') == 'body'), None)
-
-            if llm_instruction:
-                source = llm_instruction.get("source")
-                if source == "static_value":
-                    val = llm_instruction.get('value')
-                    if schema_type == 'integer':
-                        try:
-                            return int(val)
-                        except (ValueError, TypeError):
-                            return val
-                    elif schema_type == 'boolean':
-                        return str(val).lower() == 'true'
-                    elif schema_type == 'number':
-                        try:
-                            return float(val)
-                        except (ValueError, TypeError):
-                            return val
-                    else:  # string
-                        return val
-                elif source == "generate_dummy":
-                    return DataMapper._generate_dummy_value(llm_instruction)  # Pass LLM instruction for full details
-                elif source == "from_csv":
-                    table_name = llm_instruction.get("table_name")
-                    column_name = llm_instruction.get("column_name")
-                    if table_name and column_name:
-                        return f"${{csv_{table_name}_{column_name}}}"
-                elif source == "from_extraction":
-                    extracted_var_name = llm_instruction.get("extracted_variable_name")
-                    prefix = llm_instruction.get("prefix", "")
-                    if extracted_var_name in extracted_vars:
-                        return f"{prefix}{extracted_vars[extracted_var_name]}"
-                    else:
-                        logger.warning(
-                            f"LLM suggested 'from_extraction' for root primitive body but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
-                        return DataMapper._generate_dummy_value(schema)  # Fallback to dummy
+            mapping_info = st.session_state.mappings.get(endpoint_key, {}).get(".".join(current_path_segments))
+            if mapping_info:
+                if schema_type == 'integer':
+                    try:
+                        return int(mapping_info['value'])
+                    except (ValueError, TypeError):
+                        return mapping_info['value']
+                elif schema_type == 'boolean':
+                    return str(mapping_info['value']).lower() == 'true'
+                elif schema_type == 'number':
+                    try:
+                        return float(mapping_info['value'])
+                    except (ValueError, TypeError):
+                        return mapping_info['value']
+                else:  # string
+                    return mapping_info['value']
             else:
-                # Fallback to DataMapper's default dummy generation if no LLM instruction
-                return DataMapper._generate_dummy_value(schema)  # Pass the original schema for dummy generation
+                # Provide a default/dummy for a root-level primitive body
+                if schema_type == 'string':
+                    return "dummy_root_string_body"
+                elif schema_type == 'integer':
+                    return 789
+                elif schema_type == 'boolean':
+                    return True
+                elif schema_type == 'number':
+                    return 789.0
+                else:
+                    return "<<UNSUPPORTED_ROOT_PRIMITIVE_TYPE>>"
         else:
             logger.warning(f"Unsupported schema type at root: {schema_type}. Path: {'.'.join(current_path_segments)}")
             return "<<UNSUPPORTED_BODY_TYPE>>"
@@ -652,18 +453,17 @@ def main():
                         parser = SwaggerParser(swagger_url)
                         endpoints = parser.extract_endpoints()
                         st.session_state.swagger_endpoints = endpoints
-                        st.session_state.swagger_parser = parser
+                        st.session_state.swagger_parser = parser  # Store the parser instance to access swagger_data
                         st.session_state.current_swagger_url = swagger_url
 
+                        # Clear scenario and generated outputs on new Swagger fetch for isolation
                         st.session_state.selected_endpoint_keys = []
                         st.session_state.scenario_requests_configs = []
                         st.session_state.jmx_content_download = None
                         st.session_state.csv_content_download = None
                         st.session_state.mapping_metadata_download = None
-                        st.session_state.full_swagger_spec_download = None
-                        st.session_state.mappings = {}
-                        st.session_state.llm_structured_scenario = None  # Clear LLM suggestion on new swagger
-                        st.session_state.llm_text_suggestion = ""
+                        st.session_state.full_swagger_spec_download = None  # Clear full spec on new fetch
+                        st.session_state.mappings = {}  # Clear mappings too
                         st.success(f"Found {len(endpoints)} API endpoints.")
                     except Exception as e:
                         st.error(f"Failed to fetch Swagger: {str(e)}")
@@ -675,8 +475,6 @@ def main():
                         st.session_state.mapping_metadata_download = None
                         st.session_state.full_swagger_spec_download = None
                         st.session_state.mappings = {}
-                        st.session_state.llm_structured_scenario = None
-                        st.session_state.llm_text_suggestion = ""
             else:
                 st.warning("Please enter a Swagger JSON URL.")
 
@@ -687,6 +485,7 @@ def main():
             if len(st.session_state.swagger_endpoints) > 5:
                 st.info(f"... and {len(st.session_state.swagger_endpoints) - 5} more endpoints")
 
+            # Make the full swagger spec available for download after fetch
             if st.session_state.swagger_parser and st.session_state.swagger_parser.swagger_data:
                 st.session_state.full_swagger_spec_download = json.dumps(
                     st.session_state.swagger_parser.get_full_swagger_spec(), indent=2
@@ -697,11 +496,12 @@ def main():
 
         st.session_state.db_type_selected = st.selectbox(
             "Database Type",
-            ["SQLite", "MySQL", "PostgreSQL", "SQL Server"],
+            ["SQLite", "MySQL", "PostgreSQL", "SQL Server"],  # Added SQL Server
             key="db_type_select",
             index=["SQLite", "MySQL", "PostgreSQL", "SQL Server"].index(st.session_state.db_type_selected)
         )
 
+        # Removed db_connection_params_changed trigger for auto-connect
         if st.session_state.db_type_selected == "SQLite":
             db_file_path = st.text_input(
                 "SQLite Database File Path",
@@ -712,7 +512,7 @@ def main():
 
         else:  # MySQL, PostgreSQL, or SQL Server
             st.warning(
-                f"Note: For {st.session_state.db_type_selected}, ensure `pyodbc` (for SQL Server) and ODBC drivers are installed in your Python environment outside Canvas. Otherwise, schema and data will be dummy.")
+                f"Note: Live connection to {st.session_state.db_type_selected} is simulated in this environment, unless you have pyodbc and a driver installed for SQL Server. Schema and data will be dummy otherwise.")
             db_host_input = st.text_input("DB Host", value=st.session_state.db_host, key="db_host_input")
             db_user_input = st.text_input("DB Username", value=st.session_state.db_user, key="db_user_input")
             db_password_input = st.text_input("DB Password", type="password", value=st.session_state.db_password,
@@ -720,6 +520,7 @@ def main():
             db_name_input = st.text_input("DB Name", value=st.session_state.db_name, key="db_name_input")
             db_port_input = st.text_input("DB Port (optional)", value=st.session_state.db_port, key="db_port_input")
 
+            # Convert port to int if provided, else None
             port_val = None
             if db_port_input:
                 try:
@@ -729,7 +530,7 @@ def main():
                     port_val = None
 
             db_config = DatabaseConfig(
-                db_type=st.session_state.db_type_selected.lower().replace(" ", ""),
+                db_type=st.session_state.db_type_selected.lower().replace(" ", ""),  # "sql server" -> "sqlserver"
                 host=db_host_input,
                 username=db_user_input,
                 password=db_password_input,
@@ -737,20 +538,21 @@ def main():
                 port=port_val
             )
 
+            # Update session state for inputs (not trigger connection)
             st.session_state.db_host = db_host_input
             st.session_state.db_user = db_user_input
             st.session_state.db_password = db_password_input
             st.session_state.db_name = db_name_input
             st.session_state.db_port = port_val
 
-        if st.button("Connect Database", key="connect_db"):
+        if st.button("Connect Database", key="connect_db"):  # Connection is now ONLY triggered by this button
             if st.session_state.db_type_selected == "SQLite" and not db_file_path:
                 st.error("Please enter a SQLite database file path.")
                 st.session_state.db_tables = []
                 st.session_state.db_connector = None
                 st.session_state.db_tables_schema = {}
                 st.session_state.db_sampled_data = {}
-                st.session_state.mappings = {}
+                st.session_state.mappings = {}  # Clear mappings
             elif st.session_state.db_type_selected != "SQLite" and not (
                     db_config.host and db_config.username and db_config.database):
                 st.error(
@@ -759,7 +561,7 @@ def main():
                 st.session_state.db_connector = None
                 st.session_state.db_tables_schema = {}
                 st.session_state.db_sampled_data = {}
-                st.session_state.mappings = {}
+                st.session_state.mappings = {}  # Clear mappings
             else:
                 with st.spinner("Connecting to database..."):
                     try:
@@ -774,24 +576,27 @@ def main():
                             for table in tables:
                                 schema = connector.get_table_schema(table)
                                 tables_schema[table] = schema
+                                # Sample 3 rows for each table
                                 sampled_data[table] = connector.preview_data(table, limit=3)
 
                             st.session_state.db_tables_schema = tables_schema
-                            st.session_state.db_sampled_data = sampled_data
+                            st.session_state.db_sampled_data = sampled_data  # Store sampled data
 
+                            # Clear previous mappings and generated output on new DB connection
                             st.session_state.mappings = {}
                             st.session_state.jmx_content_download = None
                             st.session_state.csv_content_download = None
                             st.session_state.mapping_metadata_download = None
-                            st.session_state.llm_structured_scenario = None  # Clear LLM suggestion on new db connection
-                            st.session_state.llm_text_suggestion = ""
 
                             st.success(f"Connected to {connector.config.db_type.upper()}! Found {len(tables)} tables.")
 
+                            # --- New: Display Detailed Database Schema ---
                             if st.session_state.db_tables_schema:
                                 st.subheader("Detailed Database Schema (JSON)")
                                 st.json(st.session_state.db_tables_schema)
+                            # --- End New Section ---
 
+                            # For SQLite, if dummy DB does not exist, offer to create
                             if st.session_state.db_type_selected == "SQLite" and not os.path.exists(db_file_path):
                                 if st.button("Create Dummy SQLite DB", key="create_dummy_db_on_connect"):
                                     try:
@@ -896,7 +701,7 @@ def main():
                                         conn.commit()
                                         conn.close()
                                         st.success(f"Dummy SQLite database created at {db_file_path} with sample data.")
-                                        st.rerun()
+                                        st.rerun()  # Rerun to re-connect and load data
                                     except Exception as ex:
                                         st.error(f"Error creating dummy DB: {ex}")
 
@@ -915,6 +720,7 @@ def main():
                         st.session_state.db_sampled_data = {}
                         st.session_state.mappings = {}
 
+        # Display tables and sampled data if already connected
         if st.session_state.db_tables:
             st.subheader("Database Tables")
             for table in st.session_state.db_tables:
@@ -944,7 +750,7 @@ def main():
             height=100
         )
 
-        if st.button("Get AI Script Design", key="get_ai_design_btn"):
+        if st.button("Get AI Suggestions", key="get_ai_suggestions_btn"):
             if not st.session_state.swagger_endpoints:
                 st.error("Please fetch Swagger specification first to get AI suggestions.")
             elif not st.session_state.db_tables:
@@ -952,73 +758,31 @@ def main():
             elif not st.session_state.gemini_api_key.strip():
                 st.error("Please provide your Gemini API Key to get AI suggestions.")
             else:
-                with st.spinner("Getting AI detailed script design..."):
-                    # Recalculate mappings (This call still populates st.session_state.mappings
-                    # with DB-based suggestions, which the LLM then consumes as 'existing_mappings' if needed,
-                    # but the LLM now has full control over the final source.)
+                with st.spinner("Getting AI mapping and scenario suggestions..."):
+                    # Recalculate mappings including sampled data logic
                     st.session_state.mappings = DataMapper.suggest_mappings(
                         st.session_state.swagger_endpoints,
                         st.session_state.db_tables_schema,
-                        st.session_state.db_sampled_data
+                        st.session_state.db_sampled_data  # Pass sampled data here
                     )
 
-                    structured_scenario = call_llm_for_scenario_plan(
+                    llm_response = call_llm_for_scenario_plan(
                         prompt=prompt,
                         swagger_endpoints=st.session_state.swagger_endpoints,
                         db_tables_schema=st.session_state.db_tables_schema,
-                        db_sampled_data=st.session_state.db_sampled_data,  # Pass sampled data here
+                        existing_mappings=st.session_state.mappings,
                         thread_group_users=st.session_state.num_users_input,
                         ramp_up_time=st.session_state.ramp_up_time_input,
+                        # FIX: Use the correct session state key for loop count
                         loop_count=st.session_state.loop_count_input_specific if st.session_state.loop_count_option == "Specify iterations" else -1,
                         api_key=st.session_state.gemini_api_key
                     )
-                    if structured_scenario:
-                        st.session_state.llm_structured_scenario = structured_scenario
-                        # Generate a simple text summary from the structured data for display purposes
-                        text_summary_lines = ["AI Generated Scenario Design:"]
-                        for req in structured_scenario:
-                            text_summary_lines.append(
-                                f"- {req.get('method')} {req.get('path')} (Name: {req.get('name')})")
-                            text_summary_lines.append(f"  Description: {req.get('description', 'No description.')}")
-                            if req.get('parameters_and_body_fields'):
-                                text_summary_lines.append("  Parameters/Body Fields:")
-                                for param in req['parameters_and_body_fields']:
-                                    source_detail = ""
-                                    if param['source'] == 'from_csv':
-                                        source_detail = f" (from CSV: {param.get('table_name')}.{param.get('column_name')})"
-                                    elif param['source'] == 'from_extraction':
-                                        source_detail = f" (from Extraction: '{param.get('source_request_name')}' var: '{param.get('extracted_variable_name')}')"
-                                    elif param['source'] == 'static_value':
-                                        source_detail = f" (Static Value: {param.get('value')})"
-                                    elif param['source'] == 'generate_dummy':
-                                        source_detail = " (Generated Dummy)"
-                                    text_summary_lines.append(
-                                        f"    - {param.get('name')} (in {param.get('in')}): {param['source']}{source_detail}")
-                            if req.get('extractions'):
-                                text_summary_lines.append("  Extractions:")
-                                for ext in req['extractions']:
-                                    text_summary_lines.append(
-                                        f"    - JSONPath: {ext.get('json_path')} -> Var: {ext.get('var_name')}")
-                            if req.get('assertions'):
-                                text_summary_lines.append("  Assertions:")
-                                for ass in req['assertions']:
-                                    text_summary_lines.append(
-                                        f"    - Type: {ass.get('type')}, Value: {ass.get('value')}")
-                            if req.get('think_time_ms') is not None:
-                                text_summary_lines.append(f"  Think Time: {req.get('think_time_ms')} ms")
-                        st.session_state.llm_text_suggestion = "\n".join(text_summary_lines)
-                        st.success("AI script design generated!")
-                    else:
-                        st.session_state.llm_structured_scenario = None
-                        st.session_state.llm_text_suggestion = "Failed to generate structured AI design."
+                    st.session_state.llm_suggestion = llm_response.get("suggestion", "No specific suggestion provided.")
 
-        if st.session_state.llm_text_suggestion:
-            st.subheader("AI Suggested Test Flow (Read-Only Summary)")
-            st.markdown(st.session_state.llm_text_suggestion)
-            if st.session_state.llm_structured_scenario:
-                with st.expander("View Raw AI Structured Design"):
-                    st.json(st.session_state.llm_structured_scenario)
-            st.info("The detailed AI design will be used to auto-configure your scenario below.")
+        if st.session_state.llm_suggestion:
+            st.subheader("AI Suggested Test Flow (Read-Only)")
+            st.markdown(st.session_state.llm_suggestion)
+            st.info("Use this as a guide to configure your scenario below.")
 
     st.header("2. Load Profile Configuration")
     col1, col2, col3 = st.columns(3)
@@ -1062,10 +826,11 @@ def main():
         )
         loop_count = 1
         if loop_count_option == "Specify iterations":
+            # This is where loop_count_input_specific gets its value
             loop_count = st.number_input(
                 "Number of Iterations",
                 min_value=1,
-                value=st.session_state.loop_count_input_specific,
+                value=st.session_state.loop_count_input_specific,  # Ensure default is from session state
                 step=1,
                 key="loop_count_input_specific"
             )
@@ -1176,41 +941,48 @@ def main():
     if st.session_state.swagger_endpoints:
         endpoint_options = [f"{ep.method} {ep.path}" for ep in st.session_state.swagger_endpoints]
 
-        select_all_toggle = st.checkbox("Select All Endpoints (for AI initial design)",
-                                        key="select_all_endpoints_checkbox")
+        # New: Select All Endpoints checkbox
+        select_all_toggle = st.checkbox("Select All Endpoints", key="select_all_endpoints_checkbox")
 
-        default_selected_endpoints_for_ai = []
+        # Determine default selection based on toggle
+        default_selected_endpoints = []
         if select_all_toggle:
-            default_selected_endpoints_for_ai = endpoint_options
+            default_selected_endpoints = endpoint_options
         else:
-            default_selected_endpoints_for_ai = st.session_state.selected_endpoint_keys
+            default_selected_endpoints = st.session_state.selected_endpoint_keys
 
-        selected_endpoint_keys_for_ai_input = st.multiselect(
-            "Select API Endpoints to include in AI's initial scenario design (order does NOT reflect execution sequence, AI determines flow)",
+        selected_endpoint_keys = st.multiselect(
+            "Select API Endpoints for your scenario (order reflects execution sequence)",
             options=endpoint_options,
-            default=default_selected_endpoints_for_ai,
-            key="endpoint_selector_for_ai"
+            default=default_selected_endpoints,  # Use the dynamic default
+            key="endpoint_selector"
         )
-        st.session_state.selected_endpoint_keys = selected_endpoint_keys_for_ai_input
 
-        if st.button("Refine Scenario Manually", key="refine_scenario_btn"):
-            st.session_state.llm_structured_scenario = None  # Clear AI generated scenario
+        # Recalculate scenario configurations when endpoints change or "Refresh" is clicked
+        if selected_endpoint_keys != st.session_state.selected_endpoint_keys or st.button(
+                "Refresh Scenario Configuration", key="refresh_scenario_btn"):
+            st.session_state.selected_endpoint_keys = selected_endpoint_keys
             new_scenario_configs = []
 
+            # Recalculate mappings if not already done or if DB/Swagger changed
             st.session_state.mappings = DataMapper.suggest_mappings(
                 st.session_state.swagger_endpoints,
                 st.session_state.db_tables_schema,
                 st.session_state.db_sampled_data
             )
 
-            extracted_variables_map = {}
+            extracted_variables_map = {}  # {parameter_name_lower: JMeter_variable_name}
 
+            # --- Add Login Request if authentication is enabled ---
             if st.session_state.enable_auth_flow:
+                # For login, still rely on the endpoint object for basic path/method lookup
                 login_endpoint = next((ep for ep in st.session_state.swagger_endpoints if
                                        ep.path == st.session_state.auth_login_endpoint_path and ep.method == st.session_state.auth_login_method),
                                       None)
                 if login_endpoint:
+                    # Login body template is handled separately
                     resolved_login_body = st.session_state.auth_login_body_template
+
                     login_request_config = {
                         "endpoint_key": f"{login_endpoint.method} {login_endpoint.path}",
                         "name": "Login_Request",
@@ -1232,16 +1004,22 @@ def main():
                     extracted_variables_map["authtoken"] = "${authToken}"
                 else:
                     st.warning(
-                        f"Login endpoint {st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path} not found in Swagger spec for manual config. Authentication flow might not work as expected.")
+                        f"Login endpoint {st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path} not found in Swagger spec. Authentication flow might not work as expected.")
 
+            # For selected endpoints in the main scenario
+            # Ensure full_swagger_spec is available here.
+            # This is where `full_swagger_spec` was used before it was assigned.
             full_swagger_dict = st.session_state.swagger_parser.get_full_swagger_spec()
+
+            # Extract base path from the full swagger spec
             base_path_from_swagger = full_swagger_dict.get('basePath', '/')
+            # Ensure base_path_from_swagger starts with '/' and does not end with '/' unless it's just '/'
             if not base_path_from_swagger.startswith('/'):
                 base_path_from_swagger = '/' + base_path_from_swagger
             if base_path_from_swagger != '/' and base_path_from_swagger.endswith('/'):
                 base_path_from_swagger = base_path_from_swagger.rstrip('/')
 
-            for ep_key in st.session_state.selected_endpoint_keys:
+            for ep_key in selected_endpoint_keys:
                 method_str, path_str = ep_key.split(' ', 1)
                 method_key = method_str.lower()
 
@@ -1250,15 +1028,20 @@ def main():
                 if resolved_endpoint_data:
                     clean_path_name = re.sub(r'[^\w\s-]', '', path_str).replace('/', '_').strip('_')
                     operation_id = resolved_endpoint_data.get('operationId')
-                    request_name = f"{method_str}_{operation_id or clean_path_name}"
+                    if operation_id:
+                        request_name = f"{method_str}_{operation_id}"
+                    else:
+                        request_name = f"{method_str}_{clean_path_name}"
+
+                    # Start with the raw path from Swagger, which might contain path parameters {var}
                     jmeter_formatted_path = path_str
 
                     request_config = {
                         "endpoint_key": ep_key,
                         "name": request_name,
                         "method": method_str,
-                        "path": "",
-                        "parameters": {},
+                        "path": "",  # Will be set below after path param processing
+                        "parameters": {},  # Query parameters are handled below
                         "headers": {},
                         "body": None,
                         "assertions": [],
@@ -1266,11 +1049,14 @@ def main():
                         "think_time": 0
                     }
 
+                    # --- Process Path Parameters ---
                     if 'parameters' in resolved_endpoint_data:
                         for param in resolved_endpoint_data['parameters']:
                             if param.get('in') == 'path':
                                 param_name = param['name']
-                                jmeter_var_for_path_param = f"${{{param_name}}}"
+                                jmeter_var_for_path_param = f"${{{param_name}}}"  # Default fallback
+
+                                # Check for mapped values first (DB or static)
                                 mapping_info = st.session_state.mappings.get(ep_key, {}).get(param_name)
                                 if mapping_info:
                                     if mapping_info['source'] == "DB Sample (CSV)":
@@ -1279,11 +1065,21 @@ def main():
                                         jmeter_var_for_path_param = mapping_info['value']
                                     else:
                                         jmeter_var_for_path_param = str(mapping_info['value'])
+                                    logger.debug(
+                                        f"Path param '{param_name}' for {ep_key} using mapping: {jmeter_var_for_path_param} (Source: {mapping_info['source']})")
                                 elif param_name.lower() in extracted_variables_map:
+                                    # Then check for extracted variables from previous responses
                                     jmeter_var_for_path_param = extracted_variables_map[param_name.lower()]
+                                    logger.debug(
+                                        f"Path param '{param_name}' for {ep_key} using extracted variable: {jmeter_var_for_path_param}")
+                                else:
+                                    logger.warning(
+                                        f"Path param '{param_name}' for {ep_key} has no explicit DB/extraction/static mapping. Using generic JMeter variable: {jmeter_var_for_path_param}")
+
                                 jmeter_formatted_path = re.sub(r'\{' + re.escape(param_name) + r'\}',
                                                                jmeter_var_for_path_param, jmeter_formatted_path)
 
+                    # Set the final path for JMeter sampler (relative to base path)
                     final_request_path_for_jmeter = jmeter_formatted_path
                     if base_path_from_swagger != '/' and final_request_path_for_jmeter.startswith(
                             base_path_from_swagger):
@@ -1296,21 +1092,34 @@ def main():
                         final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
                     request_config["path"] = final_request_path_for_jmeter
 
+                    # --- Process Headers from Swagger Spec ---
                     if 'parameters' in resolved_endpoint_data:
                         for param in resolved_endpoint_data['parameters']:
                             if param.get('in') == 'header':
                                 header_name = param['name']
+
+                                # Check for mapped values or extracted variables for header value
                                 mapped_value = None
                                 mapping_info = st.session_state.mappings.get(ep_key, {}).get(header_name)
                                 if mapping_info:
                                     mapped_value = mapping_info['value']
                                 elif header_name.lower() in extracted_variables_map:
                                     mapped_value = extracted_variables_map[header_name.lower()]
+
                                 if mapped_value:
                                     request_config['headers'][header_name] = str(mapped_value)
-                                elif param.get('required'):
-                                    request_config['headers'][header_name] = f"dummy_{header_name}"
+                                else:
+                                    # Provide a dummy value for required headers if no mapping/extraction
+                                    if param.get('required'):
+                                        request_config['headers'][header_name] = f"dummy_{header_name}"
+                                    else:
+                                        # For optional headers, can decide to omit or provide empty/dummy
+                                        pass  # Currently, we'll omit optional unmapped headers
+                                logger.debug(
+                                    f"Header '{header_name}' for {ep_key} configured: {request_config['headers'].get(header_name)}")
 
+                    # Add Authorization header if auth flow is enabled and it's not the login request itself
+                    # This will override any 'Authorization' header explicitly defined in swagger parameters
                     if st.session_state.enable_auth_flow and ep_key != f"{st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path}":
                         if "authtoken" in extracted_variables_map:
                             request_config["headers"][
@@ -1319,6 +1128,7 @@ def main():
                             st.warning(
                                 f"Authentication flow enabled but auth token not found for {ep_key}. Check login configuration.")
 
+                    # Process URL/Query parameters
                     if 'parameters' in resolved_endpoint_data:
                         for param in resolved_endpoint_data['parameters']:
                             if param.get('in') == 'query':
@@ -1332,80 +1142,45 @@ def main():
                                     else:
                                         request_config['parameters'][param['name']] = "<<NO_MATCH_FOUND>>"
 
+                    # Process Request Body
                     if method_key in ["post", "put", "patch"]:
+                        # Determine Content-Type
                         content_type_header = "application/json"
-                        if resolved_endpoint_data.get('consumes'):
+                        if resolved_endpoint_data.get('consumes'):  # Swagger 2.0
                             content_type_header = resolved_endpoint_data['consumes'][0]
                         elif 'requestBody' in resolved_endpoint_data and 'content' in resolved_endpoint_data[
-                            'requestBody']:
+                            'requestBody']:  # OpenAPI 3.0
                             first_content_type = next(iter(resolved_endpoint_data['requestBody'].get('content', {})),
                                                       None)
                             if first_content_type:
                                 content_type_header = first_content_type
-                        request_config["headers"]["Content-Type"] = content_type_header
+                        request_config["headers"]["Content-Type"] = content_type_header  # Set or override Content-Type
 
                         request_body_schema = None
-                        if 'requestBody' in resolved_endpoint_data:
+                        if 'requestBody' in resolved_endpoint_data:  # OpenAPI 3.0 structure
                             content_types = resolved_endpoint_data['requestBody'].get('content', {})
                             if content_types:
+                                # Prioritize application/json, then the first available content type
                                 if 'application/json' in content_types:
                                     request_body_schema = content_types['application/json'].get('schema')
                                 else:
                                     request_body_schema = next(iter(content_types.values())).get('schema')
-                        else:
+                        else:  # Swagger 2.0 structure (body parameter)
                             for param in resolved_endpoint_data.get('parameters', []):
                                 if param.get('in') == 'body' and 'schema' in param:
                                     request_body_schema = param['schema']
                                     break
 
-                        dummy_llm_param_fields = []
-                        if ep_key in st.session_state.mappings:
-                            for param_path, mapping_data in st.session_state.mappings[ep_key].items():
-                                if 'in' in mapping_data and mapping_data[
-                                    'in'] == 'body':  # This checks the 'in' property of mapping_data itself
-                                    dummy_llm_param_fields.append({
-                                        "name": param_path,  # Use full path for nested params
-                                        "in": "body",
-                                        "source": mapping_data['source'],
-                                        "value": mapping_data['value'],
-                                        "table_name": mapping_data.get('table_name'),
-                                        "column_name": mapping_data.get('column_name'),
-                                        "type": mapping_data.get('type'),
-                                        "format": mapping_data.get('format'),  # Pass format too for dummy generation
-                                        "enum": mapping_data.get('enum'),
-                                        "minimum": mapping_data.get('minimum'),
-                                        "maximum": mapping_data.get('maximum'),
-                                        "minLength": mapping_data.get('minLength'),
-                                        "maxLength": mapping_data.get('maxLength')
-                                    })
-                                elif '.' in param_path and (param_path.split('.')[0] in ['body',
-                                                                                         'requestBody']):  # Handle cases where root might be 'body' or 'requestBody'
-                                    # This is a bit of a hack to get the nested path right for the _build_recursive_json_body_with_llm_guidance
-                                    # It implies that the 'name' in mapping for body would already be 'body.nested_field'
-                                    dummy_llm_param_fields.append({
-                                        "name": param_path,
-                                        "in": "body",
-                                        "source": mapping_data['source'],
-                                        "value": mapping_data['value'],
-                                        "table_name": mapping_data.get('table_name'),
-                                        "column_name": mapping_data.get('column_name'),
-                                        "type": mapping_data.get('type'),
-                                        "format": mapping_data.get('format'),
-                                        "enum": mapping_data.get('enum'),
-                                        "minimum": mapping_data.get('minimum'),
-                                        "maximum": mapping_data.get('maximum'),
-                                        "minLength": mapping_data.get('minLength'),
-                                        "maxLength": mapping_data.get('maxLength')
-                                    })
+                        logger.debug(
+                            f"Resolved request_body_schema for {ep_key}: {json.dumps(request_body_schema, indent=2)}")
 
                         if request_body_schema:
                             try:
-                                generated_body = _build_recursive_json_body_with_llm_guidance(
-                                    request_body_schema,
-                                    dummy_llm_param_fields,
+                                generated_body = _build_recursive_json_body(
+                                    request_body_schema,  # Pass the resolved schema directly
+                                    ep_key,
                                     [],
-                                    extracted_variables_map,
-                                    ep_key
+                                    extracted_variables_map
                                 )
                                 if isinstance(generated_body, (dict, list, int, float, bool)):
                                     request_config["body"] = json.dumps(generated_body, indent=2)
@@ -1413,24 +1188,26 @@ def main():
                                     request_config["body"] = str(generated_body)
 
                             except Exception as e:
-                                logger.error(
-                                    f"Error building recursive JSON body for {ep_key} during manual refine: {e}",
-                                    exc_info=True)
+                                logger.error(f"Error building recursive JSON body for {ep_key}: {e}", exc_info=True)
                                 request_config[
                                     "body"] = "{\n  \"message\": \"Error building dynamic body for bodySchema from full spec\"\n}"
                         else:
                             request_config[
                                 "body"] = "{\n  \"message\": \"auto-generated dummy body (no schema found in full spec)\"\n}"
 
+                    # Add standard 200 assertion if enabled
                     if st.session_state.include_scenario_assertions:
                         request_config['assertions'].append({"type": "Response Code", "value": "200"})
 
+                    # --- Correlation: Auto-add JSON Extractors for response IDs ---
+                    # Get response schemas directly from resolved_endpoint_data
                     for status_code, response_obj in resolved_endpoint_data.get('responses', {}).items():
-                        if status_code.startswith('2'):
+                        if status_code.startswith('2'):  # Successful response
                             resp_schema = None
-                            if 'schema' in response_obj:
+                            if 'schema' in response_obj:  # Swagger 2.0
                                 resp_schema = response_obj['schema']
-                            elif 'content' in response_obj:
+                            elif 'content' in response_obj:  # OpenAPI 3.0
+                                # Get the first content type's schema
                                 first_content_type = next(iter(response_obj['content']), None)
                                 if first_content_type:
                                     resp_schema = response_obj['content'][first_content_type].get('schema')
@@ -1447,6 +1224,8 @@ def main():
                                             "var_name": correlated_var_name
                                         })
                                         extracted_variables_map[prop_name.lower()] = f"${{{correlated_var_name}}}"
+                                        logger.info(
+                                            f"Detected potential correlation: '{prop_name}' from {ep_key} will be extracted as ${{{correlated_var_name}}}")
 
                             if resp_schema and resp_schema.get('type') == 'array' and 'items' in resp_schema:
                                 item_schema = resp_schema['items']
@@ -1463,6 +1242,8 @@ def main():
                                                 "var_name": correlated_var_name
                                             })
                                             extracted_variables_map[prop_name.lower()] = f"${{{correlated_var_name}}}"
+                                            logger.info(
+                                                f"Detected array correlation: First '{prop_name}' from {ep_key} will be extracted as ${{{correlated_var_name}}}")
 
                     new_scenario_configs.append(request_config)
                 else:
@@ -1471,179 +1252,16 @@ def main():
             st.session_state.scenario_requests_configs = new_scenario_configs
             st.rerun()
 
-        if st.session_state.llm_structured_scenario:
-            st.markdown("---")
-            st.subheader("AI-Designed Scenario (Processing)")
-            llm_designed_configs = []
-
-            st.session_state.mappings = DataMapper.suggest_mappings(
-                st.session_state.swagger_endpoints,
-                st.session_state.db_tables_schema,
-                st.session_state.db_sampled_data
-            )
-
-            extracted_variables_map = {}
-
-            full_swagger_dict = st.session_state.swagger_parser.get_full_swagger_spec()
-            base_path_from_swagger = full_swagger_dict.get('basePath', '/')
-            if not base_path_from_swagger.startswith('/'):
-                base_path_from_swagger = '/' + base_path_from_swagger
-            if base_path_from_swagger != '/' and base_path_from_swagger.endswith('/'):
-                base_path_from_swagger = base_path_from_swagger.rstrip('/')
-
-            for llm_req_design in st.session_state.llm_structured_scenario:
-                method_str = llm_req_design.get('method')
-                path_str = llm_req_design.get('path')
-                request_name = llm_req_design.get('name', f"{method_str}_{path_str.replace('/', '_').strip('_')}")
-                think_time = llm_req_design.get('think_time_ms', 0)
-
-                ep_key = f"{method_str} {path_str}"
-                resolved_endpoint_data = full_swagger_dict.get('paths', {}).get(path_str, {}).get(method_str.lower(),
-                                                                                                  {})
-
-                if not resolved_endpoint_data:
-                    st.warning(f"AI suggested endpoint {ep_key} not found in Swagger spec. Skipping.")
-                    continue
-
-                jmeter_formatted_path = path_str
-                request_config = {
-                    "endpoint_key": ep_key,
-                    "name": request_name,
-                    "method": method_str,
-                    "path": "",
-                    "parameters": {},
-                    "headers": {},
-                    "body": None,
-                    "assertions": [],
-                    "json_extractors": [],
-                    "think_time": think_time
-                }
-
-                body_fields_for_recursive_builder = []
-                for param_field in llm_req_design.get('parameters_and_body_fields', []):
-                    param_name = param_field['name']
-                    param_in = param_field['in']
-                    source_strategy = param_field['source']
-
-                    resolved_value = None
-
-                    if param_in == 'body':
-                        # For body fields, we collect them and process with the recursive builder
-                        body_fields_for_recursive_builder.append(param_field)
-                        continue  # Skip to next param_field, as body is processed later
-
-                    if source_strategy == "from_csv":
-                        table_name = param_field.get('table_name')
-                        column_name = param_field.get('column_name')
-                        if table_name and column_name:
-                            resolved_value = f"${{csv_{table_name}_{column_name}}}"
-                        else:
-                            logger.warning(
-                                f"LLM suggested 'from_csv' for {param_name} but missing table_name/column_name.")
-                            resolved_value = DataMapper._generate_dummy_value(param_field)
-                    elif source_strategy == "from_extraction":
-                        extracted_var_name = param_field.get('extracted_variable_name')
-                        prefix = param_field.get('prefix', '')
-                        if extracted_var_name in extracted_variables_map:
-                            resolved_value = f"{prefix}{extracted_variables_map[extracted_var_name]}"
-                        else:
-                            logger.warning(
-                                f"LLM suggested 'from_extraction' for {param_name} but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
-                            resolved_value = DataMapper._generate_dummy_value(param_field)
-                    elif source_strategy == "generate_dummy":
-                        resolved_value = DataMapper._generate_dummy_value(param_field)
-                    elif source_strategy == "static_value":
-                        resolved_value = param_field.get('value')
-
-                    if param_in == 'path':
-                        jmeter_formatted_path = re.sub(r'\{' + re.escape(param_name) + r'\}', str(resolved_value),
-                                                       jmeter_formatted_path)
-                    elif param_in == 'query':
-                        request_config['parameters'][param_name] = str(resolved_value)
-                    elif param_in == 'header':
-                        request_config['headers'][param_name] = str(resolved_value)
-
-                final_request_path_for_jmeter = jmeter_formatted_path
-                if base_path_from_swagger != '/' and final_request_path_for_jmeter.startswith(base_path_from_swagger):
-                    final_request_path_for_jmeter = final_request_path_for_jmeter[len(base_path_from_swagger):]
-                    if not final_request_path_for_jmeter.startswith('/'):
-                        final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
-                    if final_request_path_for_jmeter == "//":
-                        final_request_path_for_jmeter = "/"
-                if final_request_path_for_jmeter and not final_request_path_for_jmeter.startswith('/'):
-                    final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
-                request_config["path"] = final_request_path_for_jmeter
-
-                if method_str.lower() in ["post", "put", "patch"]:
-                    content_type_header = "application/json"
-                    if resolved_endpoint_data.get('consumes'):
-                        content_type_header = resolved_endpoint_data['consumes'][0]
-                    elif 'requestBody' in resolved_endpoint_data and 'content' in resolved_endpoint_data['requestBody']:
-                        first_content_type = next(iter(resolved_endpoint_data['requestBody'].get('content', {})), None)
-                        if first_content_type:
-                            content_type_header = first_content_type
-                    request_config["headers"]["Content-Type"] = content_type_header
-
-                    request_body_schema = None
-                    if 'requestBody' in resolved_endpoint_data:
-                        content_types = resolved_endpoint_data['requestBody'].get('content', {})
-                        if content_types:
-                            if 'application/json' in content_types:
-                                request_body_schema = content_types['application/json'].get('schema')
-                            else:
-                                request_body_schema = next(iter(content_types.values())).get('schema')
-                    else:
-                        for param in resolved_endpoint_data.get('parameters', []):
-                            if param.get('in') == 'body' and 'schema' in param:
-                                request_body_schema = param['schema']
-                                break
-
-                    if request_body_schema:
-                        try:
-                            generated_body = _build_recursive_json_body_with_llm_guidance(
-                                request_body_schema,
-                                body_fields_for_recursive_builder,
-                                [],
-                                extracted_variables_map,
-                                ep_key
-                            )
-                            if isinstance(generated_body, (dict, list, int, float, bool)):
-                                request_config["body"] = json.dumps(generated_body, indent=2)
-                            else:
-                                request_config["body"] = str(generated_body)
-                        except Exception as e:
-                            logger.error(f"Error building recursive JSON body for {ep_key} from LLM design: {e}",
-                                         exc_info=True)
-                            request_config[
-                                "body"] = "{\n  \"message\": \"Error building dynamic body from AI design\"\n}"
-                    else:
-                        request_config[
-                            "body"] = "{\n  \"message\": \"auto-generated dummy body (no schema found for AI design)\"\n}"
-
-                for assertion_data in llm_req_design.get('assertions', []):
-                    request_config['assertions'].append(assertion_data)
-
-                for extractor_data in llm_req_design.get('extractions', []):
-                    request_config['json_extractors'].append({
-                        "json_path_expr": extractor_data['json_path'],
-                        "var_name": extractor_data['var_name']
-                    })
-                    extracted_variables_map[extractor_data['var_name'].lower()] = f"${{{extractor_data['var_name']}}}"
-
-                llm_designed_configs.append(request_config)
-
-            st.session_state.scenario_requests_configs = llm_designed_configs
-            st.success("Scenario configured based on AI design!")
-
         st.markdown("---")
-        st.subheader("Current Scenario Configuration")
+        st.subheader("Selected Endpoints (Auto-Configured)")
         if st.session_state.scenario_requests_configs:
             for i, config in enumerate(st.session_state.scenario_requests_configs):
-                st.code(f"Request {i + 1}: {config['method']} {config['path']} (Name: {config['name']})")
-                with st.expander(f"View Details for {config['name']}"):
+                st.code(
+                    f"Request {i + 1}: {config['method']} {config['path']} (Name: {config['name']})")  # Show new name
+                with st.expander(f"View Auto-Configuration for {config['name']}"):
                     st.json(config)
         else:
-            st.info("No scenario configured yet. Use 'Get AI Script Design' or 'Refine Scenario Manually'.")
+            st.info("Select endpoints above to auto-configure their details.")
 
     st.markdown("---")
 
@@ -1651,9 +1269,12 @@ def main():
         if not st.session_state.swagger_endpoints:
             st.error("Please fetch a Swagger/OpenAPI JSON file and ensure endpoints are parsed.")
             return
-        if not st.session_state.scenario_requests_configs:
+        if not st.session_state.selected_endpoint_keys and not st.session_state.enable_auth_flow:
             st.error(
-                "Please generate an AI script design or refine the scenario manually before generating JMeter script.")
+                "Please select at least one API request to include in your scenario, or enable authentication flow only.")
+            return
+        if st.session_state.enable_auth_flow and not st.session_state.auth_login_endpoint_path:
+            st.error("Authentication flow is enabled, but no Login API Endpoint Path is provided.")
             return
 
         st.info("Generating JMeter script... Please wait.")
@@ -1663,20 +1284,27 @@ def main():
 
             num_users = st.session_state.num_users_input
             ramp_up_time = st.session_state.ramp_up_time_input
+            # FIX: Use the correct session state key for loop count here as well
             loop_count = st.session_state.loop_count_input_specific if st.session_state.loop_count_option == "Specify iterations" else -1
 
             global_constant_timer_delay = st.session_state.constant_timer_delay_ms if st.session_state.enable_constant_timer else 0
 
+            # Construct sampled data for CSV based on *actual used* mappings
+            # This ensures only variables explicitly marked as 'csv_' are included
             csv_data_for_jmeter = {}
             csv_headers = set()
 
+            # Iterate through the `mappings` dictionary which now contains full paths for body parameters
             for endpoint_key, params_map in st.session_state.mappings.items():
                 for param_name, mapping_info in params_map.items():
                     if mapping_info['source'] == "DB Sample (CSV)":
-                        jmeter_var_name_raw = mapping_info['value'].replace('${', '').replace('}', '')
+                        jmeter_var_name_raw = mapping_info['value'].replace('${', '').replace('}',
+                                                                                              '')  # e.g., csv_users_id
+                        # Extract original table and column from jmeter_var_name
                         parts = jmeter_var_name_raw.split('_')
                         if len(parts) >= 3 and parts[0] == 'csv':
                             table_name = parts[1]
+                            # Reconstruct original column name (can have underscores in DB)
                             column_name = "_".join(parts[2:])
 
                             if table_name in st.session_state.db_sampled_data and column_name in \
@@ -1686,6 +1314,7 @@ def main():
                                     st.session_state.db_sampled_data[table_name][column_name].tolist()
                                     csv_headers.add(jmeter_var_name_raw)
                                 else:
+                                    # Ensure lists are of same length, pad if necessary for multiple uses of same column
                                     if len(csv_data_for_jmeter[jmeter_var_name_raw]) < len(
                                             st.session_state.db_sampled_data[table_name][column_name]):
                                         csv_data_for_jmeter[jmeter_var_name_raw] = \
@@ -1693,8 +1322,8 @@ def main():
 
             generated_csv_content = None
             if csv_headers and csv_data_for_jmeter:
-                csv_headers_list = sorted(list(csv_headers))
-                generated_csv_content = ",".join(csv_headers_list) + "\n"
+                csv_headers_list = sorted(list(csv_headers))  # Ensure consistent order
+                generated_csv_content = ",".join(csv_headers_list) + "\n"  # Use full JMeter variable names as headers
 
                 max_rows = 0
                 if csv_data_for_jmeter:
@@ -1712,13 +1341,17 @@ def main():
                 thread_group_name=st.session_state.thread_group_name
             )
 
+            # Parse base URL components from the swagger_url
             parsed_url = urlparse(swagger_url)
             protocol = parsed_url.scheme
             domain = parsed_url.hostname
             port = parsed_url.port if parsed_url.port else ""
 
+            # Get the full swagger spec dictionary from the parser instance
             current_full_swagger_spec_dict = st.session_state.swagger_parser.get_full_swagger_spec()
 
+            # This base_path is the one passed to the JMeterGenerator's HTTP Defaults,
+            # which expects the base path from the Swagger spec (e.g., /v2)
             base_path_for_http_defaults = current_full_swagger_spec_dict.get('basePath', '/')
             if not base_path_for_http_defaults.startswith('/'):
                 base_path_for_http_defaults = '/' + base_path_for_http_defaults
@@ -1726,26 +1359,27 @@ def main():
                 base_path_for_http_defaults = base_path_for_http_defaults.rstrip('/')
 
             jmx_content, _ = generator.generate_jmx(
-                app_base_url=swagger_url,
+                app_base_url=swagger_url,  # Original URL for consistency
                 thread_group_users=num_users,
                 ramp_up_time=ramp_up_time,
                 loop_count=loop_count,
                 scenario_plan=scenario_plan,
-                csv_data_to_include=generated_csv_content,
+                csv_data_to_include=generated_csv_content,  # Pass pre-generated CSV content
                 global_constant_timer_delay=global_constant_timer_delay,
                 test_plan_name=st.session_state.test_plan_name,
                 thread_group_name=st.session_state.thread_group_name,
                 http_defaults_protocol=protocol,
                 http_defaults_domain=domain,
                 http_defaults_port=port,
-                http_defaults_base_path=base_path_for_http_defaults,
-                full_swagger_spec=current_full_swagger_spec_dict,
+                http_defaults_base_path=base_path_for_http_defaults,  # Pass the resolved base path
+                full_swagger_spec=current_full_swagger_spec_dict,  # Pass the full resolved spec
                 enable_setup_teardown_thread_groups=st.session_state.enable_setup_teardown_thread_groups
             )
 
-            st.session_state.jmx_content_download = jmx_content
-            st.session_state.csv_content_download = generated_csv_content
-            st.session_state.mapping_metadata_download = json.dumps(st.session_state.mappings, indent=2)
+            st.session_state.jmx_content_download = jmx_content  # Store for persistence
+            st.session_state.csv_content_download = generated_csv_content  # Store for persistence
+            st.session_state.mapping_metadata_download = json.dumps(st.session_state.mappings,
+                                                                    indent=2)  # Store mapping metadata
 
             st.success("JMeter script generated successfully!")
 
@@ -1753,8 +1387,9 @@ def main():
             st.error(f"An error occurred during script generation: {e}")
             logger.error(f"Error in main app execution: {e}", exc_info=True)
 
+    # --- Download Links (Rendered Persistently) ---
     st.subheader("Download Generated Files")
-    if st.session_state.full_swagger_spec_download:
+    if st.session_state.full_swagger_spec_download:  # New download button for full Swagger spec
         st.download_button(
             label="Download Full Swagger Spec (.json)",
             data=st.session_state.full_swagger_spec_download.encode("utf-8"),
@@ -1780,7 +1415,7 @@ def main():
             mime="text/csv",
             key="download_csv_final"
         )
-    elif st.session_state.jmx_content_download:
+    elif st.session_state.jmx_content_download:  # Only show info if JMX is generated but CSV is not
         st.info("No CSV data was generated for this test plan (no DB mappings used).")
     else:
         st.info("Generate the JMeter script above to enable download links.")
@@ -1801,6 +1436,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Ensure dummy swagger.json and petstore.db exist for initial run
     if not os.path.exists("swagger.json"):
         dummy_swagger_content = """
 {

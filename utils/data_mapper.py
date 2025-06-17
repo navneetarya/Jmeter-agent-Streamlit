@@ -1,184 +1,233 @@
-import pandas as pd
-from typing import Dict, List, Any, Optional
 import logging
+from typing import Dict, List, Any, Optional  # Import Optional
+import pandas as pd
+import re
 
 logger = logging.getLogger(__name__)
 
 
+# Assuming SwaggerEndpoint is defined in swagger_parser or imported
+# from .swagger_parser import SwaggerEndpoint # Uncomment if not already imported in app.py or if testing independently
+
 class DataMapper:
     """
-    Maps API parameters and request body fields to database fields,
-    using AI suggestions (inferred logic) and sampled data.
+    Suggests mappings between Swagger API parameters and database table columns.
+    It attempts to find best-fit matches based on naming conventions and provides
+    different mapping sources (DB Sample, Generated, Static).
     """
 
     @staticmethod
-    def suggest_mappings(endpoints: List[Any],  # Using Any to avoid circular import with SwaggerEndpoint in data_mapper
-                         tables_schema: Dict[str, List[Dict[str, str]]],
-                         db_sampled_data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    def suggest_mappings(swagger_endpoints: List[Any],
+                         # Using Any to avoid circular import, assume SwaggerEndpoint structure
+                         db_tables_schema: Dict[str, List[Dict[str, Any]]],
+                         db_sampled_data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
         """
-        Suggests mappings between API parameters and database fields, prioritizing sampled DB data.
-        Returns a nested dictionary: {endpoint_key: {param_name: {source: "...", value: "..."}}}
+        Suggests data mappings for Swagger endpoint parameters from database schema and sampled data.
+        Prioritizes exact name matches and common ID patterns.
         """
         mappings = {}
-
-        for endpoint in endpoints:
+        for endpoint in swagger_endpoints:
             endpoint_key = f"{endpoint.method} {endpoint.path}"
             mappings[endpoint_key] = {}
 
-            # Process parameters from Swagger spec (path and query)
+            # Process parameters (path, query, header)
             for param in endpoint.parameters:
-                if param.get('in') in ['query', 'path']:
-                    param_name = param.get('name', '')
-                    param_type = param.get('type', 'string')  # Default to string if type not found
+                param_name = param.get('name')
+                if not param_name:
+                    continue
 
-                    mapping_info = DataMapper._determine_param_source(
-                        param_name, param_type, tables_schema, db_sampled_data
-                    )
-                    mappings[endpoint_key][param_name] = mapping_info
+                suggested_value, source = DataMapper._find_matching_db_column(
+                    param_name, db_tables_schema, db_sampled_data
+                )
 
-            # Process parameters from request body schema (including nested properties)
-            if endpoint.request_body:
-                # Helper recursive function to process properties of a schema
-                def process_body_schema_for_mapping(schema_part: Dict[str, Any], current_path: List[str]):
-                    if not isinstance(schema_part, dict):
-                        return
+                if suggested_value is not None:
+                    mappings[endpoint_key][param_name] = {
+                        "source": source,
+                        "value": suggested_value,
+                        "type": param.get('type')  # Store original swagger type for conversion later
+                    }
+                else:
+                    # Provide a generic dummy or generated value if no DB match
+                    mappings[endpoint_key][param_name] = {
+                        "source": "Generated Value",
+                        "value": DataMapper._generate_dummy_value(param.get('type')),
+                        "type": param.get('type')
+                    }
+                logger.debug(f"Mapping for {endpoint_key} param '{param_name}': {mappings[endpoint_key][param_name]}")
 
-                    schema_type = schema_part.get('type', 'object')
-
-                    if schema_type == 'object' and 'properties' in schema_part:
-                        for prop_name, prop_details in schema_part['properties'].items():
-                            full_param_name = ".".join(current_path + [prop_name])
-
-                            if prop_details.get('type') == 'object':
-                                process_body_schema_for_mapping(prop_details, current_path + [prop_name])
-                            elif prop_details.get('type') == 'array':
-                                # For arrays, we primarily map elements within the array if they are objects
-                                # or if it's a primitive array, we try to map the array itself or its item type.
-                                if 'items' in prop_details:
-                                    if prop_details['items'].get('type') == 'object':
-                                        # Recursively process items within an array of objects
-                                        process_body_schema_for_mapping(prop_details['items'],
-                                                                        current_path + [prop_name, "_item"])
-                                    else:  # Array of primitives
-                                        item_type = prop_details['items'].get('type', 'string')
-                                        mapping_info = DataMapper._determine_param_source(
-                                            full_param_name, item_type, tables_schema, db_sampled_data,
-                                            is_body_param=True
-                                        )
-                                        mappings[endpoint_key][full_param_name] = mapping_info
-                                else:  # Array with no items schema
-                                    mapping_info = {"source": "Static/Dummy", "value": [], "type": "array"}
-                                    mappings[endpoint_key][full_param_name] = mapping_info
-                            else:  # Primitive type within an object
-                                mapping_info = DataMapper._determine_param_source(
-                                    full_param_name, prop_details.get('type', 'string'), tables_schema, db_sampled_data,
-                                    is_body_param=True
-                                )
-                                mappings[endpoint_key][full_param_name] = mapping_info
-                    elif schema_type == 'array' and 'items' in schema_part:
-                        # If the entire request body is an array (e.g., createUsersWithList)
-                        if schema_part['items'].get('type') == 'object':
-                            process_body_schema_for_mapping(schema_part['items'], current_path + [
-                                "_item"])  # Use a placeholder for array item path
-                        else:  # Array of primitives at root level
-                            item_type = schema_part['items'].get('type', 'string')
-                            mapping_info = DataMapper._determine_param_source(
-                                "".join(current_path), item_type, tables_schema, db_sampled_data, is_body_param=True
-                            )
-                            # Store it under the array's full path, indicating it applies to items
-                            mappings[endpoint_key][".".join(current_path)] = mapping_info
-                    elif current_path == []:  # Handle root level primitive body
-                        mapping_info = DataMapper._determine_param_source(
-                            "body", schema_part.get('type', 'string'), tables_schema, db_sampled_data,
-                            is_body_param=True
-                        )
-                        mappings[endpoint_key]["body"] = mapping_info
-
-                process_body_schema_for_mapping(endpoint.request_body, [])
-
+            # Process request body parameters (if applicable, typically for POST/PUT)
+            # The body schema is potentially nested, so a recursive approach is needed.
+            if endpoint.body_schema:
+                DataMapper._suggest_recursive_body_mappings(
+                    endpoint.body_schema, endpoint_key, db_tables_schema, db_sampled_data, mappings[endpoint_key], []
+                )
         return mappings
 
     @staticmethod
-    def _determine_param_source(param_name: str, param_type: str,
-                                tables_schema: Dict[str, List[Dict[str, str]]],
-                                db_sampled_data: Dict[str, pd.DataFrame],
-                                is_body_param: bool = False) -> Dict[str, Any]:
-        """Determines the best source for a parameter (DB, Generated, Static) and its value/placeholder."""
-        param_name_lower = param_name.lower()
+    def _suggest_recursive_body_mappings(schema: Dict[str, Any], endpoint_key: str,
+                                         db_tables_schema: Dict[str, List[Dict[str, Any]]],
+                                         db_sampled_data: Dict[str, pd.DataFrame],
+                                         current_endpoint_mappings: Dict[str, Any],
+                                         path_segments: List[str]):
+        """
+        Recursively suggests mappings for fields within a nested request body schema.
+        `path_segments` keeps track of the current JSON path (e.g., ["user", "address", "street"]).
+        """
+        schema_type = schema.get('type', 'object')
 
-        # Strip path prefix (e.g., "category.id" becomes "id") for matching against DB columns
-        clean_param_name_for_db_match = param_name_lower.split('.')[-1]
+        if schema_type == 'object':
+            properties = schema.get('properties', {})
+            for prop_name, prop_details in properties.items():
+                full_param_name_path = path_segments + [prop_name]
+                full_param_name_str = ".".join(full_param_name_path)  # e.g., "user.address.street"
 
-        # 1. Try to pull from DB (sampled data) - direct match (primary/foreign keys)
-        for table_name, columns in tables_schema.items():
-            for column in columns:
-                column_name = column['name'].lower()
-                # Check for exact match for primary/foreign keys
-                if clean_param_name_for_db_match == column_name and (column.get('is_pk') or column.get('is_fk')):
-                    if table_name in db_sampled_data and not db_sampled_data[table_name].empty and column['name'] in \
-                            db_sampled_data[table_name].columns:
-                        if is_body_param:  # For body, use a concrete sampled value
-                            return {"source": "DB Sample (First Row)",
-                                    "value": str(db_sampled_data[table_name][column['name']].iloc[0]),
-                                    "type": param_type}
-                        else:  # For path/query, use CSV variable
-                            return {"source": "DB Sample (CSV)",
-                                    "value": f"${{csv_{table_name.replace('.', '_')}_{column['name'].replace('.', '_')}}}",
-                                    "type": param_type}
+                # Check if this property has already been explicitly mapped during prior processing
+                if full_param_name_str in current_endpoint_mappings:
+                    continue
 
-                # Check for `id` parameters matching `id` columns in related tables (e.g., `user_id` -> `users.id`)
-                # This logic is already for the cleaned name
-                if clean_param_name_for_db_match.endswith(
-                        "_id") and column_name == "id" and clean_param_name_for_db_match.replace("_id",
-                                                                                                 "") == table_name.lower():
-                    if table_name in db_sampled_data and not db_sampled_data[table_name].empty and column['name'] in \
-                            db_sampled_data[table_name].columns:
-                        if is_body_param:
-                            return {"source": "DB Sample (First Row)",
-                                    "value": str(db_sampled_data[table_name][column['name']].iloc[0]),
-                                    "type": param_type}
-                        else:
-                            return {"source": "DB Sample (CSV)",
-                                    "value": f"${{csv_{table_name.replace('.', '_')}_{column['name'].replace('.', '_')}}}",
-                                    "type": param_type}
+                if prop_details.get('type') == 'object' or prop_details.get('type') == 'array':
+                    # Recurse for nested structures
+                    DataMapper._suggest_recursive_body_mappings(
+                        prop_details, endpoint_key, db_tables_schema, db_sampled_data,
+                        current_endpoint_mappings, full_param_name_path
+                    )
+                else:
+                    # Try to find a DB match for primitive properties
+                    suggested_value, source = DataMapper._find_matching_db_column(
+                        prop_name, db_tables_schema, db_sampled_data
+                    )
+                    if suggested_value is not None:
+                        current_endpoint_mappings[full_param_name_str] = {
+                            "source": source,
+                            "value": suggested_value,
+                            "type": prop_details.get('type')
+                        }
+                    else:
+                        # Default to generated value for primitive types if no DB match
+                        current_endpoint_mappings[full_param_name_str] = {
+                            "source": "Generated Value",
+                            "value": DataMapper._generate_dummy_value(prop_details.get('type')),
+                            "type": prop_details.get('type')
+                        }
+        elif schema_type == 'array' and 'items' in schema:
+            # For arrays, we try to map the elements within the array.
+            # This is simplified: it assumes elements of the array are of a consistent type/schema.
+            # The key for array items is typically just the array name itself, or a combined path
+            # to signify the 'item' within the array.
 
-        # 2. Try to pull from DB (sampled data) - partial match on clean name
-        for table_name, columns in tables_schema.items():
-            for column in columns:
-                column_name = column['name'].lower()
-                if clean_param_name_for_db_match in column_name or column_name in param_name_lower:  # Changed this condition slightly to use param_name_lower for broader match
-                    if table_name in db_sampled_data and not db_sampled_data[table_name].empty and column['name'] in \
-                            db_sampled_data[table_name].columns:
-                        if is_body_param:
-                            return {"source": "DB Sample (First Row)",
-                                    "value": str(db_sampled_data[table_name][column['name']].iloc[0]),
-                                    "type": param_type}
-                        else:
-                            return {"source": "DB Sample (CSV)",
-                                    "value": f"${{csv_{table_name.replace('.', '_')}_{column['name'].replace('.', '_')}}}",
-                                    "type": param_type}
+            # The mapping for the entire array (if it's simple, e.g., array of strings mapped to a single CSV column)
+            # would be at the current `path_segments` level.
+            full_param_name_str = ".".join(path_segments)
 
-        # 3. Auto-generate
-        if "id" in clean_param_name_for_db_match or "uuid" in clean_param_name_for_db_match:
-            return {"source": "Generated", "value": "${__UUID()}", "type": param_type}
-        if "timestamp" in clean_param_name_for_db_match or "date" in clean_param_name_for_db_match:
-            return {"source": "Generated", "value": "${__time()}",
-                    "type": param_type}  # JMeter timestamp function (epoch milliseconds)
+            # Check for direct mapping of the array itself (e.g., to a CSV list)
+            suggested_value, source = DataMapper._find_matching_db_column(
+                path_segments[-1] if path_segments else "",  # Use last segment for array name
+                db_tables_schema, db_sampled_data,
+                is_array=True
+            )
+            if suggested_value is not None:
+                current_endpoint_mappings[full_param_name_str] = {
+                    "source": source,
+                    "value": suggested_value,  # This would ideally be a list of values
+                    "type": schema.get('type')
+                }
+                logger.debug(f"Array '{full_param_name_str}' mapped directly to: {suggested_value}")
+            else:
+                # If no direct array mapping, try to map properties within the array items
+                # We append "_item" to the path to indicate mapping for array elements
+                item_path_segments = path_segments + ["_item"]
+                DataMapper._suggest_recursive_body_mappings(
+                    schema['items'], endpoint_key, db_tables_schema, db_sampled_data,
+                    current_endpoint_mappings, item_path_segments
+                )
+        else:  # Primitive type at current level
+            full_param_name_str = ".".join(path_segments)
+            if full_param_name_str and full_param_name_str not in current_endpoint_mappings:
+                suggested_value, source = DataMapper._find_matching_db_column(
+                    full_param_name_str, db_tables_schema, db_sampled_data
+                )
+                if suggested_value is not None:
+                    current_endpoint_mappings[full_param_name_str] = {
+                        "source": source,
+                        "value": suggested_value,
+                        "type": schema.get('type')
+                    }
+                else:
+                    current_endpoint_mappings[full_param_name_str] = {
+                        "source": "Generated Value",
+                        "value": DataMapper._generate_dummy_value(schema.get('type')),
+                        "type": schema.get('type')
+                    }
 
-        # 4. Static value / Dummy (based on param_type)
+    @staticmethod
+    def _find_matching_db_column(param_name: str,
+                                 db_tables_schema: Dict[str, List[Dict[str, Any]]],
+                                 db_sampled_data: Dict[str, pd.DataFrame],
+                                 is_array: bool = False) -> (Any, str):
+        """
+        Finds a matching database column for a given API parameter name.
+        Prioritizes exact matches, then case-insensitive matches, then common ID patterns.
+        Returns the JMeter variable string (e.g., "${csv_users_id}") or sampled value, and source.
+        """
+        lower_param_name = param_name.lower()
+
+        # Check for direct matches (case-insensitive)
+        for table_name, columns_schema in db_tables_schema.items():
+            for col_schema in columns_schema:
+                col_name = col_schema['name']
+                col_type = col_schema['type']
+
+                # Exact match or common ID/name match
+                if lower_param_name == col_name.lower():
+                    # For arrays, if we have sampled data as a list, return that directly.
+                    # Otherwise, provide a CSV variable for the first element.
+                    if is_array and table_name in db_sampled_data and col_name in db_sampled_data[table_name].columns:
+                        # Assuming for array, we might want the whole list of sampled data
+                        return db_sampled_data[table_name][col_name].tolist(), "DB Sample (Array)"
+                    elif table_name in db_sampled_data and col_name in db_sampled_data[table_name].columns and not \
+                    db_sampled_data[table_name].empty:
+                        # Return JMeter CSV variable reference
+                        return f"${{csv_{table_name}_{col_name}}}", "DB Sample (CSV)"
+                    else:
+                        return f"dummy_{param_name}", "Generated Value"  # No data in sampled table, fall back
+
+                # Check for common ID/name patterns
+                if ("id" in lower_param_name and "id" in col_name.lower()) or \
+                        ("name" in lower_param_name and "name" in col_name.lower()) or \
+                        ("status" in lower_param_name and "status" in col_name.lower()):
+                    if col_schema.get('is_primary_key') or col_schema.get('is_foreign_key'):
+                        if table_name in db_sampled_data and col_name in db_sampled_data[table_name].columns and not \
+                        db_sampled_data[table_name].empty:
+                            return f"${{csv_{table_name}_{col_name}}}", "DB Sample (CSV)"
+
+        # Check for special cases like "username" -> "users" table "username" column
+        if lower_param_name == "username" and "users" in db_tables_schema:
+            for col_schema in db_tables_schema["users"]:
+                if col_schema['name'].lower() == "username" and "username" in db_sampled_data["users"].columns:
+                    return f"${{csv_users_username}}", "DB Sample (CSV)"
+        if lower_param_name == "password" and "users" in db_tables_schema:
+            for col_schema in db_tables_schema["users"]:
+                if col_schema['name'].lower() == "password" and "password" in db_sampled_data["users"].columns:
+                    return f"${{csv_users_password}}", "DB Sample (CSV)"
+
+        # Fallback to generating based on data type if no direct DB match found
+        return None, "Generated Value"
+
+    @staticmethod
+    def _generate_dummy_value(param_type: Optional[str]) -> Any:
+        """Generates a dummy value based on a given parameter type."""
         if param_type == 'string':
-            return {"source": "Static/Dummy", "value": f"dummy_{clean_param_name_for_db_match}", "type": param_type}
+            return "dummy_string"
         elif param_type == 'integer':
-            return {"source": "Static/Dummy", "value": 123, "type": param_type}  # Changed to int for number types
+            return 123
         elif param_type == 'boolean':
-            return {"source": "Static/Dummy", "value": True, "type": param_type}  # Changed to bool for boolean types
+            return True
+        elif param_type == 'number':
+            return 123.45
         elif param_type == 'array':
-            # For arrays, provide a dummy array. The recursive builder will populate items.
-            return {"source": "Static/Dummy", "value": [], "type": param_type}  # Default to empty list
+            return []  # For array, just return empty list as dummy
         elif param_type == 'object':
-            # For objects, provide a dummy empty object. The recursive builder will populate properties.
-            return {"source": "Static/Dummy", "value": {}, "type": param_type}
-
-        # 5. Fallback - No Match Found
-        return {"source": "No Match Found", "value": "<<NO_MATCH_FOUND>>", "type": param_type}
+            return {}  # For object, just return empty dict as dummy
+        else:
+            return "dummy_value"
 
