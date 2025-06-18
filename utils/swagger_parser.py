@@ -1,179 +1,150 @@
 import requests
 import json
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, field
+from urllib.parse import urlparse
 import logging
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SwaggerEndpoint:
-    """Represents a single API endpoint extracted from a Swagger/OpenAPI specification."""
-    method: str  # e.g., 'get', 'post', 'put', 'delete'
-    path: str  # e.g., '/pets/{id}'
+    method: str
+    path: str
+    operation_id: Optional[str] = None
     summary: Optional[str] = None
-    description: Optional[str] = None
-    operation_id: Optional[str] = None  # Added operation_id
-    parameters: List[Dict[str, Any]] = field(default_factory=list)  # Includes path, query, header, formData parameters
-    body_schema: Optional[
-        Dict[str, Any]] = None  # For 'body' parameter schema (Swagger 2.0) or requestBody content schema (OpenAPI 3.0)
+    parameters: List[Dict[str, Any]] = field(default_factory=list)
+    body_schema: Optional[Dict[str, Any]] = None
     responses: Dict[str, Any] = field(default_factory=dict)
-    security: List[Dict[str, Any]] = field(default_factory=list)
-    consumes: List[str] = field(default_factory=list)  # For Swagger 2.0
-    produces: List[str] = field(default_factory=list)  # For Swagger 2.0
-    tags: List[str] = field(default_factory=list)
+
+    def to_dict(self):
+        """Converts the SwaggerEndpoint object to a dictionary, suitable for JSON serialization."""
+        # Note: We're not deeply copying here for simplicity, direct access is fine for serialization.
+        # If any fields were non-primitive objects that needed custom serialization, that would go here.
+        return {
+            "method": self.method,
+            "path": self.path,
+            "operation_id": self.operation_id,
+            "summary": self.summary,
+            "parameters": self.parameters,
+            "body_schema": self.body_schema,
+            "responses": self.responses
+        }
 
 
 class SwaggerParser:
-    """Parses a Swagger/OpenAPI specification to extract API endpoint details."""
-
     def __init__(self, swagger_url: str):
         self.swagger_url = swagger_url
-        self.swagger_data: Dict[str, Any] = self._fetch_swagger_spec()
+        self.swagger_data: Dict[str, Any] = {}
+        self._fetch_swagger_spec()
 
-    def _fetch_swagger_spec(self) -> Dict[str, Any]:
-        """Fetches the Swagger/OpenAPI JSON specification from the given URL."""
-        logger.info(f"Fetching Swagger spec from: {self.swagger_url}")
+    def _fetch_swagger_spec(self):
+        """Fetches the Swagger/OpenAPI specification from the given URL."""
         try:
             response = requests.get(self.swagger_url)
-            response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
-            swagger_data = response.json()
-            logger.info("Swagger spec fetched successfully.")
-            return swagger_data
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            self.swagger_data = response.json()
+            logger.info(f"Successfully fetched Swagger spec from {self.swagger_url}")
         except requests.exceptions.RequestException as e:
             logger.error(f"Error fetching Swagger spec from {self.swagger_url}: {e}")
-            st.error(f"Error fetching Swagger spec: {e}. Please check the URL and your internet connection.")
-            raise
+            raise ConnectionError(f"Could not connect to Swagger URL or invalid response: {e}")
         except json.JSONDecodeError as e:
-            logger.error(f"Error decoding Swagger spec JSON from {self.swagger_url}: {e}")
-            st.error(f"Error decoding Swagger spec: The response is not valid JSON. {e}")
+            logger.error(f"Error decoding JSON from Swagger spec at {self.swagger_url}: {e}")
+            raise ValueError(f"Invalid JSON in Swagger spec: {e}")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while fetching Swagger spec: {e}")
             raise
 
     def get_full_swagger_spec(self) -> Dict[str, Any]:
-        """Returns the full parsed Swagger/OpenAPI specification."""
+        """Returns the full fetched Swagger/OpenAPI specification."""
         return self.swagger_data
 
     def _resolve_ref(self, ref_path: str) -> Optional[Dict[str, Any]]:
-        """Resolves a JSON $ref path within the Swagger data."""
+        """Resolves a JSON schema $ref reference within the Swagger data."""
+        # Example ref_path: '#/definitions/Pet'
         parts = ref_path.split('/')
-        # Remove '#', as the path is relative to the root of the document
-        if parts[0] == '#':
-            parts = parts[1:]
-
         current_data = self.swagger_data
-        for part in parts:
+        for part in parts[1:]:  # Skip '#'
             if part in current_data:
                 current_data = current_data[part]
             else:
-                logger.warning(f"Could not resolve reference part: {part} in {ref_path}")
+                logger.warning(f"Reference part '{part}' not found in {ref_path}")
                 return None
         return current_data
 
-    def _get_schema_from_param(self, param: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Extracts the schema from a parameter definition, resolving $ref if necessary.
-        Handles both Swagger 2.0 (param['schema']) and OpenAPI 3.0 (param['content']['application/json']['schema']).
-        """
-        if '$ref' in param:
-            return self._resolve_ref(param['$ref'])
-        if 'schema' in param:  # Swagger 2.0 body parameter
-            if '$ref' in param['schema']:
-                return self._resolve_ref(param['schema']['$ref'])
-            return param['schema']
-
-        # OpenAPI 3.0 requestBody structure
-        if 'requestBody' in param:
-            request_body = param['requestBody']
-            if 'content' in request_body:
-                # Try application/json first, then other content types
-                for content_type in ['application/json', 'application/xml', 'application/x-www-form-urlencoded',
-                                     'text/plain']:
-                    if content_type in request_body['content']:
-                        if 'schema' in request_body['content'][content_type]:
-                            schema = request_body['content'][content_type]['schema']
-                            if '$ref' in schema:
-                                return self._resolve_ref(schema['$ref'])
-                            return schema
-
-        # For parameters that are not body/requestBody but might have inline schema
-        if 'type' in param:
-            return param  # Parameter itself defines the schema for simple cases
-
-        return None
-
     def extract_endpoints(self) -> List[SwaggerEndpoint]:
-        """
-        Extracts and structures all API endpoints from the loaded Swagger data.
-        Handles both Swagger 2.0 and OpenAPI 3.0 spec differences.
-        """
+        """Extracts API endpoints with their methods, paths, and relevant details."""
         endpoints: List[SwaggerEndpoint] = []
         paths = self.swagger_data.get('paths', {})
 
-        for path, methods in paths.items():
-            for method, details in methods.items():
-                if method in ['get', 'post', 'put', 'delete', 'patch', 'head', 'options', 'trace']:
-                    parameters = []
-                    body_schema = None  # Will store the resolved schema for the request body
+        for path, methods_data in paths.items():
+            for method, details in methods_data.items():
+                if method.lower() in ['get', 'post', 'put', 'delete', 'patch']:
+                    operation_id = details.get('operationId')
+                    summary = details.get('summary')
 
-                    # Process parameters (path, query, header, formData)
-                    # For OpenAPI 3.0, parameters can be directly under operation or in components/parameters
-                    # For Swagger 2.0, they are directly under operation
-                    if 'parameters' in details:
-                        for param_def in details['parameters']:
-                            if '$ref' in param_def:
-                                resolved_param_def = self._resolve_ref(param_def['$ref'])
-                                if resolved_param_def:
-                                    param_def = resolved_param_def
-                                else:
-                                    logger.warning(f"Could not resolve parameter reference: {param_def['$ref']}")
-                                    continue  # Skip if ref cannot be resolved
+                    parameters_raw = details.get('parameters', [])
+                    parameters_processed: List[Dict[str, Any]] = []
+                    body_schema_resolved: Optional[Dict[str, Any]] = None
 
-                            # Handle body parameter specifically for Swagger 2.0
-                            if param_def.get('in') == 'body':
-                                body_schema = self._get_schema_from_param(param_def)
+                    for param in parameters_raw:
+                        if '$ref' in param:
+                            resolved_param = self._resolve_ref(param['$ref'])
+                            if resolved_param:
+                                parameters_processed.append(resolved_param)
+                                # If it's a body parameter that was a $ref, extract its schema
+                                if resolved_param.get('in') == 'body' and 'schema' in resolved_param:
+                                    body_schema_raw = resolved_param['schema']
+                                    if '$ref' in body_schema_raw:
+                                        body_schema_resolved = self._resolve_ref(body_schema_raw['$ref'])
+                                    else:
+                                        body_schema_resolved = body_schema_raw
                             else:
-                                parameters.append(param_def)
+                                logger.warning(f"Could not resolve parameter reference: {param['$ref']}")
+                                parameters_processed.append(param)  # Include raw if resolution fails
+                        else:
+                            parameters_processed.append(param)
+                            # Directly extract body schema if 'in' is 'body'
+                            if param.get('in') == 'body' and 'schema' in param:
+                                body_schema_raw = param['schema']
+                                if '$ref' in body_schema_raw:
+                                    body_schema_resolved = self._resolve_ref(body_schema_raw['$ref'])
+                                else:
+                                    body_schema_resolved = body_schema_raw
 
-                    # Handle requestBody for OpenAPI 3.0
+                    # Handle 'requestBody' for OpenAPI 3.0+ (Swagger 2.0 uses 'body' parameter)
                     if 'requestBody' in details:
-                        request_body_content = details['requestBody'].get('content', {})
-                        for content_type, media_type_obj in request_body_content.items():
-                            if 'schema' in media_type_obj:
-                                schema = media_type_obj['schema']
-                                if '$ref' in schema:
-                                    body_schema = self._resolve_ref(schema['$ref'])
+                        request_body = details['requestBody']
+                        content_types = request_body.get('content', {})
+                        if 'application/json' in content_types:
+                            schema_raw = content_types['application/json'].get('schema')
+                            if schema_raw:
+                                if '$ref' in schema_raw:
+                                    body_schema_resolved = self._resolve_ref(schema_raw['$ref'])
                                 else:
-                                    body_schema = schema
-                                break  # Take the first schema found (e.g., application/json)
+                                    body_schema_resolved = schema_raw
+                        # Add more content types if needed (e.g., application/xml, application/x-www-form-urlencoded)
 
-                    # Handle responses
-                    responses = {}
-                    if 'responses' in details:
-                        for status_code, response_obj in details['responses'].items():
-                            if '$ref' in response_obj:
-                                resolved_response_obj = self._resolve_ref(response_obj['$ref'])
-                                if resolved_response_obj:
-                                    responses[status_code] = resolved_response_obj
-                                else:
-                                    logger.warning(f"Could not resolve response reference: {response_obj['$ref']}")
-                            else:
-                                responses[status_code] = response_obj
+                    # Capture responses for potential extraction/assertions
+                    responses_data = {}
+                    for status_code, response_obj in details.get('responses', {}).items():
+                        # Resolve $ref for response schemas if present
+                        if 'schema' in response_obj and '$ref' in response_obj['schema']:
+                            response_obj['schema'] = self._resolve_ref(response_obj['schema']['$ref'])
+                        responses_data[status_code] = response_obj
 
-                    endpoint = SwaggerEndpoint(
-                        method=method.upper(),
-                        path=path,
-                        summary=details.get('summary'),
-                        description=details.get('description'),
-                        operation_id=details.get('operationId'),  # Extracted operationId
-                        parameters=parameters,
-                        body_schema=body_schema,
-                        responses=responses,
-                        security=details.get('security', []),
-                        consumes=details.get('consumes', []),
-                        produces=details.get('produces', []),
-                        tags=details.get('tags', [])
+                    endpoints.append(
+                        SwaggerEndpoint(
+                            method=method.upper(),
+                            path=path,
+                            operation_id=operation_id,
+                            summary=summary,
+                            parameters=parameters_processed,
+                            body_schema=body_schema_resolved,
+                            responses=responses_data
+                        )
                     )
-                    endpoints.append(endpoint)
+        logger.info(f"Extracted {len(endpoints)} API endpoints.")
         return endpoints
 
