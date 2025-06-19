@@ -3,7 +3,7 @@ import requests
 import json
 import sqlite3
 import pandas as pd
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import logging
 from dataclasses import dataclass, field
 import os
@@ -190,20 +190,129 @@ def _repair_truncated_json(json_string: str) -> str:
     return repaired_output
 
 
-def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpoint],
+def _match_swagger_path_with_generated_path(swagger_endpoints: List[SwaggerEndpoint], method: str, generated_path: str) -> Tuple[Optional[SwaggerEndpoint], Dict[str, str]]:
+    """
+    Attempts to match a generated path from LLM to an actual Swagger endpoint,
+    extracting path parameters if the generated path contains concrete values.
+    Returns the matched SwaggerEndpoint and a dict of extracted path params.
+    """
+    extracted_params = {}
+    
+    for ep in swagger_endpoints:
+        if ep.method.upper() != method.upper():
+            continue
+
+        # Convert Swagger path to a regex pattern
+        swagger_path_regex_pattern = ep.path
+        path_param_names = []
+        
+        # Identify path parameters and build regex
+        # Replace {paramName} with a named capture group for regex
+        for param in ep.parameters:
+            if param.get('in') == 'path':
+                param_name = param['name']
+                # Escape existing curly braces in the swagger path, then replace param placeholders
+                swagger_path_regex_pattern = swagger_path_regex_pattern.replace(f"{{{param_name}}}", f"(?P<{param_name}>[^/]+)")
+                path_param_names.append(param_name)
+        
+        # Ensure the regex matches the full path
+        swagger_path_regex_pattern = "^" + swagger_path_regex_pattern + "$"
+        
+        match = re.match(swagger_path_regex_pattern, generated_path)
+        
+        if match:
+            # Extract concrete values for path parameters
+            for p_name in path_param_names:
+                if p_name in match.groupdict():
+                    extracted_params[p_name] = match.group(p_name)
+            return ep, extracted_params
+            
+    return None, {}
+
+
+def call_llm_for_scenario_plan(llm_prompt_input: str, swagger_endpoints: List[SwaggerEndpoint], # Renamed prompt to llm_prompt_input
                                db_tables_schema: Dict[str, List[Dict[str, Any]]], # Changed to Any for schema details
                                db_sampled_data: Dict[str, pd.DataFrame], # Added sampled data for LLM context
                                thread_group_users: int,
                                ramp_up_time: int,
                                loop_count: int,
+                               include_assertions_flag: bool, # New flag for assertions
+                               enable_auth_flow_flag: bool, # New flag for auth flow
                                api_key: str) -> Optional[List[Dict[str, Any]]]: # Now returns a list of scenario requests
     """
     Calls an LLM to generate a detailed, structured test plan (scenario plan)
     in JSON format, including parameter sourcing, assertions, and extractions.
     """
 
+    protocol_segment = "https://"
+    domain_segment = "generativelanguage.googleapis.com"
+    path_segment = "/v1beta/models/gemini-2.0-flash:generateContent?key="
+
+    temp_base_api_url = "".join([protocol_segment, domain_segment, path_segment])
+    base_api_url_cleaned = _clean_url_string(temp_base_api_url)
+    api_url = base_api_url_cleaned + api_key
+
+    # Filter swagger_endpoints based on user prompt for specific endpoints or methods
+    filtered_swagger_endpoints = []
+    lower_prompt = llm_prompt_input.lower() # Use the input prompt here
+
+    # Default to all if no specific filter is found
+    found_specific_filter = False
+
+    # Improved logic to find multiple specific endpoints in the prompt
+    # Look for patterns like "GET /path" or "POST /another/path"
+    # This regex is more robust for extracting multiple endpoint paths
+    specific_endpoint_patterns = re.findall(r'(get|post|put|delete|patch)\s+([/\w-]+(?:/[{\w}]+)*)', lower_prompt)
+    
+    if specific_endpoint_patterns:
+        st.info(f"Detected specific endpoint requests in prompt: {specific_endpoint_patterns}")
+        for method, path in specific_endpoint_patterns:
+            for ep in swagger_endpoints:
+                # Normalize paths for comparison (e.g., /v1/detailsbyappcds vs /v1/detailsbyappcds)
+                normalized_ep_path = ep.path.rstrip('/')
+                normalized_req_path = path.rstrip('/')
+                # Simple exact match for now, could be extended to use path parameters like /{id}
+                if ep.method.lower() == method.lower() and normalized_ep_path == normalized_req_path:
+                    filtered_swagger_endpoints.append(ep)
+                    found_specific_filter = True
+        if not filtered_swagger_endpoints and specific_endpoint_patterns:
+            st.warning("No matching endpoints found in Swagger spec for the requested paths in the prompt. Proceeding with all available endpoints.")
+            filtered_swagger_endpoints = swagger_endpoints # Fallback if specific endpoints not found
+    elif "only include get endpoints" in lower_prompt:
+        filtered_swagger_endpoints = [ep for ep in swagger_endpoints if ep.method == "GET"]
+        found_specific_filter = True
+    elif "only include post endpoints" in lower_prompt:
+        filtered_swagger_endpoints = [ep for ep in swagger_endpoints if ep.method == "POST"]
+        found_specific_filter = True
+    elif "design scripts for specific endpoints:" in lower_prompt:
+        # Extract specific paths from the prompt using regex
+        specific_paths = re.findall(r'/\w+/\w+/[a-zA-Z0-9/]+', lower_prompt) # More general regex for paths
+        if specific_paths:
+            for path in specific_paths:
+                # Need to iterate through all methods for the specified path
+                for ep in swagger_endpoints:
+                    # Match path exactly (after potential stripping of method)
+                    if path.strip() in ep.path: # Using 'in' for flexibility, could be exact match too
+                        filtered_swagger_endpoints.append(ep)
+            found_specific_filter = True
+    elif "/v1/detailsbyappcds" in lower_prompt: # Explicitly checking for the user's requested endpoint
+        for ep in swagger_endpoints:
+            if ep.path == "/v1/detailsbyappcds" and ep.method == "GET":
+                filtered_swagger_endpoints.append(ep)
+        found_specific_filter = True
+    elif "/api/v1/application/minthreadcount" in lower_prompt: # Explicitly checking for the user's requested endpoint
+        for ep in swagger_endpoints:
+            if ep.path == "/api/v1/application/minthreadcount" and ep.method == "GET":
+                filtered_swagger_endpoints.append(ep)
+        found_specific_filter = True
+
+
+    if not found_specific_filter: # If no explicit filtering instruction, include all
+        filtered_swagger_endpoints = swagger_endpoints
+
+    # Now, use filtered_swagger_endpoints for swagger_summary
     swagger_summary = []
-    for ep in swagger_endpoints:
+    for ep in filtered_swagger_endpoints:
         # Include a more concise summary of parameters and body schema for LLM
         params_info = []
         for p in ep.parameters:
@@ -234,7 +343,7 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
         
         swagger_summary.append({
             "method": ep.method,
-            "path": ep.path,
+            "path": ep.path, # Crucial: Send the template path to the LLM
             "operationId": ep.operation_id,
             "summary": ep.summary, # Keep summary for LLM context
             "parameters": params_info,
@@ -261,158 +370,131 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
         else:
             sampled_data_summary_concise[table_name] = {"columns": [], "has_data": False}
 
-    llm_prompt = f"""
-    You are an expert in performance testing and JMeter script generation.
-    Your task is to design a detailed test scenario plan in JSON format.
-    This plan should directly specify each API request, how its parameters and body fields are sourced (from CSV, from previous extractions, generated dummy data, or static values),
-    what assertions should be applied, and what values should be extracted from responses.
-    Be concise in descriptions and strictly adhere to the JSON schema.
+    # Construct the final prompt using the input prompt from the UI
+    # UPDATED: Enhanced LLM prompt for assertions, headers, and CSV variables
+    final_llm_prompt = f"""
+    {llm_prompt_input}
 
-    User's test scenario request: {prompt}
+    **Input Context:**
+    -   **Swagger Endpoints Summary:** ```json\n{json.dumps(swagger_summary, indent=2)}\n```
+    -   **Detailed Database Schema:** ```json\n{json.dumps(db_schema_summary, indent=2)}\n```
+    -   **Sampled Database Data Summary (column names and data availability):** ```json\n{json.dumps(sampled_data_summary_concise, indent=2)}\n```
+    -   **Thread Group Users:** `{thread_group_users}`
+    -   **Ramp-up Time (seconds):** `{ramp_up_time}`
+    -   **Loop Count:** `{loop_count}` (Note: -1 means infinite)
+    -   **Include Assertions in Scenario:** `{include_assertions_flag}` (If true, add response_code 200 assertion to each sampler)
+    -   **Authentication Flow Enabled:** `{enable_auth_flow_flag}` (If true, and not a login request, add Authorization header with Bearer ${{auth_token}}). Assume `auth_token` is extracted from a prior login request.
 
-    Available Swagger Endpoints (with concise parameter and body schemas):
-    {json.dumps(swagger_summary, indent=2)}
+    **CRITICAL REQUIREMENTS FOR EACH `http_sampler`:**
+    * **Headers**: ALWAYS include a `headers` array.
+        * For any sampler with a `body` (e.g., POST, PUT, PATCH requests), it MUST include `{{\"name\": \"Content-Type\", \"value\": \"application/json\"}}`.
+        * For all samplers *except* the designated login request, if `Authentication Flow Enabled` is `true`, it MUST include `{{\"name\": \"Authorization\", \"value\": \"Bearer ${{auth_token}}\"}}`.
+    * **Assertions**: ALWAYS include an `assertions` array.
+        * It MUST include a `{{\"type\": \"response_code\", \"pattern\": \"XXX\"}}` assertion, where XXX is "200" for GET, PUT, PATCH requests, "201" for POST requests, and "204" for DELETE requests.
+        * For GET, POST, PUT, and PATCH requests, it MUST also include a `{{\"type\": \"text_response\", \"pattern\": \"[relevant_key_field]\"}}` assertion. The `[relevant_key_field]` should be a primary identifier or a common success message expected in the response body (e.g., `ApplicationCD`, `clientId`, `authProviderCd`, `roleName`, `schemeName`, `portalCd`, `mappingId`, `status`, `updated`).
 
-    Detailed Database Schema (includes column names, types, and key info):
-    {json.dumps(db_schema_summary, indent=2)}
-
-    Sampled Database Data (column names and data availability hint):
-    {json.dumps(sampled_data_summary_concise, indent=2)}
-
-    Current Application Settings:
-    - Number of Users: {thread_group_users}
-    - Ramp-up Time (seconds): {ramp_up_time}
-    - Loop Count: {loop_count} (Use -1 for infinite)
-    - Authentication Enabled: {st.session_state.enable_auth_flow}
-    - Login Endpoint Path: {st.session_state.auth_login_endpoint_path}
-    - Auth Token JSON Path: {st.session_state.auth_token_json_path}
-    - Auth Header Name: {st.session_state.auth_header_name}
-    - Auth Header Prefix: {st.session_state.auth_header_prefix}
-
-    Design the test scenario as a JSON array of request objects. Each request object must follow this structure EXACTLY:
-    ```json
-    [
-      {{
-        "name": "Login_User", 
-        "method": "POST",
-        "path": "/user/login", 
-        "description": "User login.",
-        "parameters_and_body_fields": [
-          {{ "name": "username", "in": "body", "source": "from_csv", "table_name": "users", "column_name": "username", "type": "string" }},
-          {{ "name": "password", "in": "body", "source": "from_csv", "table_name": "users", "column_name": "password", "type": "string" }}
-        ],
-        "assertions": [
-          {{ "type": "Response Code", "value": "200" }}
-        ],
-        "extractions": [
-          {{ "json_path": "{st.session_state.auth_token_json_path}", "var_name": "authToken" }}
-        ],
-        "think_time_ms": 500
-      }},
-      {{
-        "name": "Get_Pet_By_ID",
-        "method": "GET",
-        "path": "/pet/{{petId}}", 
-        "description": "Fetch pet details.",
-        "parameters_and_body_fields": [
-          {{ "name": "petId", "in": "path", "source": "from_csv", "table_name": "pets", "column_name": "id", "type": "integer", "format": "int64" }},
-          {{ "name": "{st.session_state.auth_header_name}", "in": "header", "source": "from_extraction", "source_request_name": "Login_User", "extracted_variable_name": "authToken", "prefix": "{st.session_state.auth_header_prefix}" }}
-        ],
-        "assertions": [
-          {{ "type": "Response Code", "value": "200" }}
-        ],
-        "extractions": [],
-        "think_time_ms": 100
-      }}
-    ]
-    ```
-    
-    For each `parameters_and_body_fields` item, **adhere to these strict rules**:
-    - `name`: Parameter/field name. For body fields in a JSON object, use dot notation for nesting (e.g., 'user.address.street').
-    - `in`: `path`, `query`, `header`, `body`.
-    - `source`: `from_csv`, `from_extraction`, `generate_dummy`, `static_value`.
-    - **IF `source` IS `"from_csv"`**: You **MUST INCLUDE BOTH** `"table_name"` AND `"column_name"`. These MUST correspond to tables and columns in `Detailed Database Schema` and `Sampled Database Data`. The `"value"` field **MUST NOT** be present. Fields like `"source_request_name"`, `"extracted_variable_name"`, `"prefix"` **MUST NOT** be present.
-    - **IF `source` IS `"static_value"`**: You **MUST INCLUDE ONLY** the `"value"` field (e.g., `"value": "some_static_text"`). Fields like `"table_name"`, `"column_name"`, `"source_request_name"`, `"extracted_variable_name"`, `"prefix"` **MUST NOT** be present.
-    - **IF `source` IS `"from_extraction"`**: You **MUST INCLUDE BOTH** `"source_request_name"` AND `"extracted_variable_name"`. An optional `"prefix"` field can also be included. Fields like `"table_name"`, `"column_name"`, `"value"` **MUST NOT** be present.
-    - **IF `source` IS `"generate_dummy"`**: You **MUST NOT** include `"table_name"`, `"column_name"`, `"source_request_name"`, `"extracted_variable_name"`, `"value"`, or `"prefix"`. Include original Swagger `type`, `format`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength` to guide dummy data generation if available.
-
-    Your response MUST be ONLY the JSON array described above, with no additional text, markdown, or conversational elements. **Ensure the JSON is always perfectly formed and complete, with all brackets and commas correctly placed and no trailing commas or incomplete structures. DO NOT include comments in the JSON output.**
     """
-
-    protocol_segment = "https://"
-    domain_segment = "generativelanguage.googleapis.com"
-    path_segment = "/v1beta/models/gemini-2.0-flash:generateContent?key="
-
-    temp_base_api_url = "".join([protocol_segment, domain_segment, path_segment])
-    base_api_url_cleaned = _clean_url_string(temp_base_api_url)
-    api_url = base_api_url_cleaned + api_key
-
+    
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": llm_prompt}]}],
+        "contents": [{"role": "user", "parts": [{"text": final_llm_prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
             "responseSchema": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "name": {"type": "STRING"},
-                        "method": {"type": "STRING", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
-                        "path": {"type": "STRING"},
-                        "description": {"type": "STRING"},
-                        "parameters_and_body_fields": {
-                            "type": "ARRAY",
-                            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "test_plan": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "thread_group": {
                                 "type": "OBJECT",
                                 "properties": {
-                                    "name": {"type": "STRING"},
-                                    "in": {"type": "STRING", "enum": ["path", "query", "header", "body"]},
-                                    "source": {"type": "STRING", "enum": ["from_csv", "from_extraction", "generate_dummy", "static_value"]},
-                                    # All these are optional here because they are conditionally required/forbidden by the 'source' value,
-                                    # which we enforce via the prompt instructions and post-processing.
-                                    "table_name": {"type": "STRING"},
-                                    "column_name": {"type": "STRING"},
-                                    "source_request_name": {"type": "STRING"},
-                                    "extracted_variable_name": {"type": "STRING"},
-                                    "value": {"type": "STRING"}, # This one is the problem child for from_csv
-                                    "prefix": {"type": "STRING"},
-                                    "type": {"type": "STRING"}, # Original Swagger type
-                                    "format": {"type": "STRING"}, # Original Swagger format
-                                    "enum": {"type": "ARRAY", "items": {"type": "STRING"}},
-                                    "minimum": {"type": "NUMBER"},
-                                    "maximum": {"type": "NUMBER"},
-                                    "minLength": {"type": "INTEGER"},
-                                    "maxLength": {"type": "INTEGER"}
+                                    "num_threads": {"type": "INTEGER"},
+                                    "ramp_up": {"type": "INTEGER"}
                                 },
-                                "required": ["name", "in", "source"]
-                            }
-                        },
-                        "assertions": {
-                            "type": "ARRAY",
-                            "items": {
+                                "required": ["num_threads", "ramp_up"]
+                            },
+                            "csv_data_set_config": {
                                 "type": "OBJECT",
                                 "properties": {
-                                    "type": {"type": "STRING", "enum": ["Response Code", "Response Body Contains"]},
-                                    "value": {"type": "STRING"}
+                                    "filename": {"type": "STRING"},
+                                    "variable_names": {"type": "ARRAY", "items": {"type": "STRING"}}
                                 },
-                                "required": ["type", "value"]
+                                "required": ["filename", "variable_names"]
+                            },
+                            "http_samplers": { # Changed to array of http_sampler objects
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "name": {"type": "STRING"},
+                                        "method": {"type": "STRING", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
+                                        "path": {"type": "STRING"}, # LLM should provide template path
+                                        "path_params": { # NEW: Explicit path parameters
+                                            "type": "ARRAY",
+                                            "items": {
+                                                "type": "OBJECT",
+                                                "properties": {
+                                                    "name": {"type": "STRING"},
+                                                    "value": {"type": "STRING"}
+                                                },
+                                                "required": ["name", "value"]
+                                            }
+                                        },
+                                        "query_params": {
+                                            "type": "ARRAY",
+                                            "items": {
+                                                "type": "OBJECT",
+                                                "properties": {
+                                                    "name": {"type": "STRING"},
+                                                    "value": {"type": "STRING"}
+                                                },
+                                                "required": ["name", "value"]
+                                            }
+                                        },
+                                        "body": {"type": "STRING"}, 
+                                        "content_type": {"type": "STRING"},
+                                        "headers": {
+                                            "type": "ARRAY",
+                                            "items": {
+                                                "type": "OBJECT",
+                                                "properties": {
+                                                    "name": {"type": "STRING"},
+                                                    "value": {"type": "STRING"}
+                                                },
+                                                "required": ["name", "value"]
+                                            }
+                                        },
+                                        "assertions": { # Assertions moved inside http_sampler
+                                            "type": "ARRAY",
+                                            "items": {
+                                                "type": "OBJECT",
+                                                "properties": {
+                                                    "type": {"type": "STRING", "enum": ["response_code", "text_response"]},
+                                                    "pattern": {"type": "STRING"}
+                                                },
+                                                "required": ["type", "pattern"]
+                                            }
+                                        },
+                                        "extractions": { # Extractions moved inside http_sampler
+                                            "type": "ARRAY",
+                                            "items": {
+                                                "type": "OBJECT",
+                                                "properties": {
+                                                    "json_path": {"type": "STRING"},
+                                                    "var_name": {"type": "STRING"}
+                                                },
+                                                "required": ["json_path", "var_name"]
+                                            }
+                                        }
+                                    },
+                                    "required": ["name", "method", "path"]
+                                }
                             }
                         },
-                        "extractions": {
-                            "type": "ARRAY",
-                            "items": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "json_path": {"type": "STRING"},
-                                    "var_name": {"type": "STRING"}
-                                },
-                                "required": ["json_path", "var_name"]
-                            }
-                        },
-                        "think_time_ms": {"type": "INTEGER"}
-                    },
-                    "required": ["name", "method", "path"]
-                }
+                        "required": ["thread_group", "csv_data_set_config", "http_samplers"] # Updated required field
+                    }
+                },
+                "required": ["test_plan"]
             }
         }
     }
@@ -439,7 +521,22 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
             try:
                 parsed_json = json.loads(json_response_str)
                 logger.info(f"Successfully parsed LLM JSON response.")
-                return parsed_json
+
+                # If LLM generated body as a string, parse it into a Python object
+                # This now needs to iterate through each http_sampler in the array
+                if 'test_plan' in parsed_json and 'http_samplers' in parsed_json['test_plan'] and \
+                   isinstance(parsed_json['test_plan']['http_samplers'], list):
+                    
+                    for sampler in parsed_json['test_plan']['http_samplers']:
+                        if 'body' in sampler and isinstance(sampler['body'], str):
+                            try:
+                                sampler['body'] = json.loads(sampler['body'])
+                                logger.info(f"Successfully parsed HTTP sampler '{sampler.get('name')}' body string to JSON object.")
+                            except json.JSONDecodeError as body_parse_error:
+                                logger.error(f"Failed to parse HTTP sampler '{sampler.get('name')}' body string from LLM response: {body_parse_error}")
+                                pass # Body remains a string if it can't be parsed
+                
+                return [parsed_json] # Wrap the single object in a list
             except json.JSONDecodeError as e:
                 # Attempt to repair the JSON string if parsing fails
                 st.warning(f"Attempting to repair truncated JSON response. Original error: {e}")
@@ -448,7 +545,21 @@ def call_llm_for_scenario_plan(prompt: str, swagger_endpoints: List[SwaggerEndpo
                 try:
                     parsed_json = json.loads(repaired_json_str)
                     st.success("Successfully repaired and parsed LLM JSON response.")
-                    return parsed_json
+
+                    # If LLM generated body as a string after repair, parse it into a Python object
+                    # This now needs to iterate through each http_sampler in the array
+                    if 'test_plan' in parsed_json and 'http_samplers' in parsed_json['test_plan'] and \
+                       isinstance(parsed_json['test_plan']['http_samplers'], list):
+                        for sampler in parsed_json['test_plan']['http_samplers']:
+                            if 'body' in sampler and isinstance(sampler['body'], str):
+                                try:
+                                    sampler['body'] = json.loads(sampler['body'])
+                                    logger.info(f"Successfully parsed HTTP sampler '{sampler.get('name')}' body string to JSON object after repair.")
+                                except json.JSONDecodeError as body_parse_error:
+                                    logger.error(f"Failed to parse HTTP sampler '{sampler.get('name')}' body string from LLM response after repair: {body_parse_error}")
+                                    pass # Body remains a string if it can't be parsed
+
+                    return [parsed_json] # Wrap the single object in a list
                 except json.JSONDecodeError as repair_e:
                     st.error(f"Failed to parse LLM's JSON response even after repair. This indicates a severe issue with the LLM's output format. Error: {repair_e}")
                     st.code(f"Problematic JSON string (after attempted cleanup and repair):\n{repaired_json_str}") # Show the problematic string to the user
@@ -565,6 +676,458 @@ def main():
     if 'loop_count_input_specific' not in st.session_state:
         st.session_state.loop_count_input_specific = 1
 
+    # Default LLM prompt for initial display
+    # UPDATED: Adjusted the prompt to reflect the new expected JSON output structure
+    # and added explicit instructions for headers, assertions, and CSV variables.
+    # Emphasize that the path should be the OpenAPI template path.
+    default_llm_prompt = """
+    You are an INTELLIGENT AUTOMATION ENGINEER with expert-level experience in building dynamic, data-driven JMeter test plans using OpenAPI (Swagger), database schemas, and sample data inputs.
+
+    Your task is to GENERATE a fully functional, dynamic JMeter test configuration in a **single JSON object** that describes a complete `test_plan`. This output will be used by another component to construct the full JMeter .jmx test plan.
+
+    **Crucial Instructions:**
+    * **Single Test Plan Output:** Your response MUST be a single JSON object with a top-level key `test_plan`. This `test_plan` object must contain `thread_group`, `csv_data_set_config`, and `http_samplers` (note: `http_samplers` is now an array).
+    * **Strict Data Source Adherence:** You MUST ONLY use the provided `Swagger Endpoints Summary`, `Detailed Database Schema`, and `Sampled Database Data Summary` as your definitive sources of truth for all API definitions, database structures, and sample values. Do NOT invent data or refer to external knowledge.
+    * **Endpoint Filtering & Multiple Samplers:** Your scenario MUST include ALL endpoints explicitly requested by the user in the `prompt`. If the `prompt` specifies multiple endpoints (e.g., "GET /api/v1/application/minthreadcount" and "GET /v1/detailsbyappcds"), you MUST generate a separate `http_sampler` object for EACH of these in the `http_samplers` array.
+    * **Data Sourcing for `http_sampler`:**
+        * **`path`**: For the `path` field, you MUST use the exact **OpenAPI template path** (e.g., `/pet/{petId}`, NOT `/pet/123` or any concrete value). This is crucial for correct mapping to Swagger definitions.
+        * **`path_params`**: If the endpoint has path parameters (e.g., `{petId}` in the `path`), you MUST include them in this array with their `name` and `value`. If a value comes from CSV, use the JMeter variable format, e.g., `"${csv_users_appcd}"` or `"${csv_orders_order_id}"`. Otherwise, use a static value or a dummy value.
+        * **`query_params`**: If parameters are in `query`, list them here with their `name` and `value`. If a value comes from CSV, use the JMeter variable format, e.g., `"${csv_users_username}"`. Otherwise, use a static value or a dummy value.
+        * **`body`**: If the request has a JSON body, you MUST provide it as a **JSON string**. For example, if the body is `{"key": "value"}` then output `"{\"key\": \"value\"}"`. Values within this string can be static, or JMeter variables (e.g., `"${clientId}"`) if sourced from CSV.
+        * **`content_type`**: String like "application/json". Use `null` if no body.
+        * **`extractions` (Per Sampler)**: If dynamic data extraction is needed (e.g., extracting a token after login or an ID from a creation response), include `extractions` *within the relevant `http_sampler` object*. The `json_path` should be accurate, and `var_name` should be a descriptive JMeter variable name (e.g., `auth_token`, `pet_id`).
+    * **CRITICAL REQUIREMENTS FOR EACH `http_sampler`:**
+        * **Headers**: ALWAYS include a `headers` array.
+            * For any sampler with a `body` (e.g., POST, PUT, PATCH requests), it MUST include `{"name": "Content-Type", "value": "application/json"}`.
+            * For all samplers *except* the designated login request, if `Authentication Flow Enabled` is `true`, it MUST include `{"name": "Authorization", "value": "Bearer ${auth_token}"}`.
+        * **Assertions**: ALWAYS include an `assertions` array.
+            * It MUST include a `{"type": "response_code", "pattern": "XXX"}` assertion, where XXX is "200" for GET, PUT, PATCH requests, "201" for POST requests, and "204" for DELETE requests.
+            * For GET, POST, PUT, and PATCH requests, it MUST also include a `{"type": "text_response", "pattern": "[relevant_key_field]"}` assertion. The `[relevant_key_field]` should be a primary identifier or a common success message expected in the response body (e.g., `ApplicationCD`, `clientId`, `authProviderCd`, `roleName`, `schemeName`, `portalCd`, `mappingId`, `status`, `updated`).
+    * **Authentication Flow (`http_samplers` order):**
+        * If `Authentication Flow Enabled` is `true`, your `http_samplers` array SHOULD start with a login request (e.g., `POST /user/login`) that includes an `extractions` definition to capture the `auth_token`. Subsequent authenticated requests MUST then include the `Authorization` header using this extracted token (`Bearer ${auth_token}`).
+    * **CSV Data Set Configuration (`csv_data_set_config`):**
+        * The `variable_names` array in `csv_data_set_config` MUST contain the exact names of ALL JMeter variables (e.g., `client_appcd`, `client_clientid`, `master_portalcd`, `master_authprovidercd`, `master_roleid`, `master_schemename`) that are used in your `http_samplers` and are sourced from CSV (e.g., `${csv_client_appcd}`). These names should directly correspond to the `table_name_column_name` format for clarity. The `filename` can be `data.csv`.
+
+    **Generate JMeter test plan for ALL the following endpoints:**
+
+    **Client**
+    GET /v1/detailsbyappcds
+    GET /api/v1/client
+    POST /api/v1/client
+    POST /v1/detailsbyappcd
+    GET /v1/secrets/{appcd}
+    GET /api/v1/client/{appcd}/secret
+
+    **Master**
+    GET /api/v1/authprovider/all
+    GET /api/v1/role/all
+    GET /api/v1/authprovider/{authProviderCd}/portal
+    GET /api/v1/portal/{portalCd}/authprovider
+    POST /api/v1/portal/{portalCd}/authprovider
+    GET /api/v1/portal/{portalCd}/role
+    POST /api/v1/portal/{portalCd}/role
+    GET /api/v1/authenticationscheme/all
+    GET /api/v1/authenticationscheme/{portalCd}
+    POST /api/v1/authenticationscheme/{portalCd}
+    GET /api/v1/portalroles/all
+    GET /api/v1/mapping/portals
+
+    **Output Expectations:**
+    Your response MUST be ONLY the JSON object described below, with no additional text, markdown, or conversational elements. **Ensure the JSON is always perfectly formed and complete, with all brackets and commas correctly placed and no trailing commas or incomplete structures. DO NOT include comments in the JSON output.**
+
+    ```json
+    {
+      "test_plan": {
+        "thread_group": {
+          "num_threads": 1,
+          "ramp_up": 1
+        },
+        "csv_data_set_config": {
+          "filename": "data.csv",
+          "variable_names": ["client_appcd", "client_clientid", "master_portalcd", "master_authprovidercd", "master_roleid", "master_schemename", "users_username", "users_password"]
+        },
+        "http_samplers": [
+          {
+            "name": "Login_User",
+            "method": "GET",
+            "path": "/user/login",
+            "path_params": [],
+            "query_params": [
+              {"name": "username", "value": "${csv_users_username}"},
+              {"name": "password", "value": "${csv_users_password}"}
+            ],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"}
+            ],
+            "extractions": [
+              {"json_path": "$.token", "var_name": "auth_token"}
+            ]
+          },
+          {
+            "name": "Get_Client_Details_By_Appcds",
+            "method": "GET",
+            "path": "/v1/detailsbyappcds",
+            "path_params": [],
+            "query_params": [
+              {"name": "appCD", "value": "${csv_client_appcd}"},
+              {"name": "clientId", "value": "${csv_client_clientid}"}
+            ],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "ApplicationCD"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Client_api_v1_client",
+            "method": "GET",
+            "path": "/api/v1/client",
+            "path_params": [],
+            "query_params": [
+              {"name": "appCD", "value": "${csv_client_appcd}"},
+              {"name": "clientId", "value": "${csv_client_clientid}"}
+            ],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "appCD"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Add_Client_api_v1_client",
+            "method": "POST",
+            "path": "/api/v1/client",
+            "path_params": [],
+            "query_params": [],
+            "body": "{\"ApplicationCD\": \"${csv_client_appcd}\", \"LegacyClientCD\": \"${csv_client_clientid}\"}",
+            "content_type": "application/json",
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "201"},
+              {"type": "text_response", "pattern": "clientId"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Add_Client_v1_detailsbyappcd",
+            "method": "POST",
+            "path": "/v1/detailsbyappcd",
+            "path_params": [],
+            "query_params": [],
+            "body": "{\"ApplicationCD\": \"${csv_client_appcd}\", \"LegacyClientCD\": \"${csv_client_clientid}\"}",
+            "content_type": "application/json",
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "201"},
+              {"type": "text_response", "pattern": "ApplicationCD"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Test_Client_Secret_v1_secrets_appcd",
+            "method": "GET",
+            "path": "/v1/secrets/{appcd}",
+            "path_params": [
+              {"name": "appcd", "value": "${csv_client_appcd}"}
+            ],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Test_Client_Secret_api_v1_client_appcd_secret",
+            "method": "GET",
+            "path": "/api/v1/client/{appcd}/secret",
+            "path_params": [
+              {"name": "appcd", "value": "${csv_client_appcd}"}
+            ],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_All_Authentication_Provider",
+            "method": "GET",
+            "path": "/api/v1/authprovider/all",
+            "path_params": [],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "authProviderCd"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_All_Role",
+            "method": "GET",
+            "path": "/api/v1/role/all",
+            "path_params": [],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "roleName"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Authentication_Provider_Portal",
+            "method": "GET",
+            "path": "/api/v1/authprovider/{authProviderCd}/portal",
+            "path_params": [
+              {"name": "authProviderCd", "value": "${csv_master_authprovidercd}"}
+            ],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "portalCd"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Portal_Authentication_Provider",
+            "method": "GET",
+            "path": "/api/v1/portal/{portalCd}/authprovider",
+            "path_params": [
+              {"name": "portalCd", "value": "${csv_master_portalcd}"}
+            ],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "authProviderCd"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Add_Portal_Authentication_Provider",
+            "method": "POST",
+            "path": "/api/v1/portal/{portalCd}/authprovider",
+            "path_params": [
+              {"name": "portalCd", "value": "${csv_master_portalcd}"}
+            ],
+            "query_params": [],
+            "body": "{\"authProviderCd\": \"${csv_master_authprovidercd}\"}",
+            "content_type": "application/json",
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "201"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Portal_Role",
+            "method": "GET",
+            "path": "/api/v1/portal/{portalCd}/role",
+            "path_params": [
+              {"name": "portalCd", "value": "${csv_master_portalcd}"}
+            ],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "roleId"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Add_Portal_Role",
+            "method": "POST",
+            "path": "/api/v1/portal/{portalCd}/role",
+            "path_params": [
+              {"name": "portalCd", "value": "${csv_master_portalcd}"}
+            ],
+            "query_params": [],
+            "body": "{\"roleId\": \"${csv_master_roleid}\"}",
+            "content_type": "application/json",
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "201"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_All_Authentication_Scheme",
+            "method": "GET",
+            "path": "/api/v1/authenticationscheme/all",
+            "path_params": [],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "schemeName"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Portal_Authentication_Scheme",
+            "method": "GET",
+            "path": "/api/v1/authenticationscheme/{portalCd}",
+            "path_params": [
+              {"name": "portalCd", "value": "${csv_master_portalcd}"}
+            ],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "schemeId"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Add_Portal_Authentication_Scheme",
+            "method": "POST",
+            "path": "/api/v1/authenticationscheme/{portalCd}",
+            "path_params": [
+              {"name": "portalCd", "value": "${csv_master_portalcd}"}
+            ],
+            "query_params": [],
+            "body": "{\"schemeName\": \"${csv_master_schemename}\"}",
+            "content_type": "application/json",
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "201"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_Portal_Roles_All",
+            "method": "GET",
+            "path": "/api/v1/portalroles/all",
+            "path_params": [],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "portalRole"}
+            ],
+            "extractions": []
+          },
+          {
+            "name": "Get_All_PortalAuthMapping",
+            "method": "GET",
+            "path": "/api/v1/mapping/portals",
+            "path_params": [],
+            "query_params": [],
+            "body": null,
+            "content_type": null,
+            "headers": [
+              {"name": "Authorization", "value": "Bearer ${auth_token}"},
+              {"name": "Content-Type", "value": "application/json"}
+            ],
+            "assertions": [
+              {"type": "response_code", "pattern": "200"},
+              {"type": "text_response", "pattern": "mappingId"}
+            ],
+            "extractions": []
+          }
+        ]
+      }
+    }
+    ```
+    For each `path_params`, `query_params`, `body`, `headers`, `assertions`, and `extractions` item, **adhere to these strict rules**:
+    -   **`path_params`**: Array of objects. Each object must have `name` (string) and `value` (string, can be a JMeter variable like `${variable_name}`).
+    -   **`query_params`**: Array of objects. Each object must have `name` (string) and `value` (string, can be a JMeter variable like `${variable_name}`).
+    -   **`body`**: A JSON string (e.g., `"{\"key\": \"value\"}"`). Values can be JMeter variables. Use `null` if no body.
+    -   **`content_type`**: String like "application/json". Use `null` if no body.
+    -   **`headers`**: Array of objects. Each object must have `name` (string) and `value` (string, can be a JMeter variable).
+    -   **`assertions`**: Array of objects. Each object must have `type` (string, "response_code" or "text_response") and `pattern` (string). This is now inside `http_sampler`.
+    -   **`extractions`**: Array of objects. Each object must have `json_path` (string, JSONPath expression) and `var_name` (string, name of the JMeter variable to store the extracted value). This is now inside `http_sampler`.
+    """
+
+    if 'llm_prompt_text' not in st.session_state:
+        st.session_state.llm_prompt_text = default_llm_prompt
+
     # Helper function to recursively build JSON body based on schema and LLM-suggested mappings
     def _build_recursive_json_body_with_llm_guidance(
         schema: Dict[str, Any], 
@@ -578,7 +1141,7 @@ def main():
         prioritizing LLM-suggested sourcing strategies and integrating extracted variables
         and DataMapper for CSV/dummy generation.
         """
-        logger.debug(f"Entering _build_recursive_json_body_with_llm_guidance for path: {'.'.join(current_path_segments)}, schema_type: {schema.get('type')}")
+        logger.debug(f"Entering _build_recursive_json_body_with_llm_guidance with: {'.'.join(current_path_segments)}, schema_type: {schema.get('type')}")
 
         if not isinstance(schema, dict):
             logger.debug(f"Schema is not a dictionary: {schema}. Returning as is.")
@@ -604,6 +1167,7 @@ def main():
                     if source == "from_csv":
                         table_name = llm_instruction.get("table_name")
                         column_name = llm_instruction.get("column_name")
+                        # PRIORITIZE table_name and column_name for from_csv, ignore 'value' from LLM if present
                         if table_name and column_name:
                             jmeter_var = f"${{csv_{table_name}_{column_name}}}"
                             body_obj[prop_name] = jmeter_var
@@ -623,7 +1187,6 @@ def main():
                              value_set = True
                              logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM extraction instruction: {resolved_value}")
                         else:
-                             # Fallback to a placeholder or dummy if extraction source not found
                              logger.warning(f"LLM suggested 'from_extraction' for {prop_name} but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
                              body_obj[prop_name] = DataMapper._generate_dummy_value(llm_instruction) # Use llm_instruction as it contains schema details
                              value_set = True
@@ -716,6 +1279,7 @@ def main():
                 elif source == "from_csv":
                     table_name = llm_instruction.get("table_name")
                     column_name = llm_instruction.get("column_name")
+                    # PRIORITIZE table_name and column_name for from_csv, ignore 'value' from LLM if present
                     if table_name and column_name:
                         return f"${{csv_{table_name}_{column_name}}}"
                     else:
@@ -792,20 +1356,32 @@ def main():
                 with st.spinner("Fetching Swagger specification..."):
                     try:
                         parser = SwaggerParser(swagger_url)
-                        endpoints = parser.extract_endpoints()
-                        st.session_state.swagger_endpoints = endpoints
-                        st.session_state.swagger_parser = parser
-                        st.session_state.current_swagger_url = swagger_url
-                        
-                        st.session_state.selected_endpoint_keys = []
-                        st.session_state.scenario_requests_configs = []
-                        st.session_state.jmx_content_download = None
-                        st.session_state.csv_content_download = None
-                        st.session_state.mapping_metadata_download = None
-                        st.session_state.full_swagger_spec_download = None
-                        st.session_state.mappings = {}
-                        st.session_state.llm_structured_scenario = None # Clear LLM suggestion on new swagger
-                        st.success(f"Found {len(endpoints)} API endpoints.")
+                        if parser.load_swagger_spec(): # Load the spec first
+                            endpoints = parser.parse() # Corrected method call here
+                            st.session_state.swagger_endpoints = endpoints
+                            st.session_state.swagger_parser = parser
+                            st.session_state.current_swagger_url = swagger_url
+                            
+                            st.session_state.selected_endpoint_keys = []
+                            st.session_state.scenario_requests_configs = []
+                            st.session_state.jmx_content_download = None
+                            st.session_state.csv_content_download = None
+                            st.session_state.mapping_metadata_download = None
+                            st.session_state.full_swagger_spec_download = None
+                            st.session_state.mappings = {}
+                            st.session_state.llm_structured_scenario = None # Clear LLM suggestion on new swagger
+                            st.success(f"Found {len(endpoints)} API endpoints.")
+                        else:
+                            st.error("Failed to load Swagger spec. Check URL and console for errors.")
+                            st.session_state.swagger_endpoints = []
+                            st.session_state.selected_endpoint_keys = []
+                            st.session_state.scenario_requests_configs = []
+                            st.session_state.jmx_content_download = None
+                            st.session_state.csv_content_download = None
+                            st.session_state.mapping_metadata_download = None
+                            st.session_state.full_swagger_spec_download = None
+                            st.session_state.mappings = {}
+                            st.session_state.llm_structured_scenario = None
                     except Exception as e:
                         st.error(f"Failed to fetch Swagger: {str(e)}")
                         st.session_state.swagger_endpoints = []
@@ -823,7 +1399,7 @@ def main():
         if st.session_state.swagger_endpoints:
             if st.session_state.swagger_parser and st.session_state.swagger_parser.swagger_data:
                 st.session_state.full_swagger_spec_download = json.dumps(
-                    st.session_state.swagger_parser.get_full_swagger_spec(), indent=2
+                    st.session_state.swagger_parser.swagger_data, indent=2 # Use swagger_data directly
                 )
             
             # Download button for parsed swagger endpoints
@@ -883,7 +1459,6 @@ def main():
             except Exception as e:
                 st.error(f"Error loading sampled DB data from file: {e}")
                 st.session_state.db_sampled_data = {}
-
 
         if st.session_state.db_type_selected == "SQLite":
             db_file_path = st.text_input(
@@ -1081,10 +1656,13 @@ def main():
             help="Enter your Google Gemini API Key. Get one from Google AI Studio."
         )
 
-        prompt = st.text_area(
-            "Describe your test scenario (for AI suggestions)",
-            value="Generate a JMeter script that covers all available API endpoints. For each endpoint, use mapped database fields if available, otherwise generate dummy data. Aim for a typical user flow involving GET, POST, PUT, and DELETE operations where appropriate. If possible, include an authentication flow by logging in first and using the obtained token.",
-            height=100
+        # Move the prompt text area here
+        st.subheader("LLM Prompt Configuration")
+        st.session_state.llm_prompt_text = st.text_area(
+            "Edit the detailed prompt for the LLM",
+            value="Please create jmeter script for end point mentioned below",
+            height=100, # Increased height to show more of the detailed prompt
+            help="Customize the instructions and examples provided to the LLM for scenario generation. This text is sent directly to the LLM."
         )
         
         if st.button("Get AI Script Design", key="get_ai_design_btn"):
@@ -1103,13 +1681,15 @@ def main():
                     )
                         
                     structured_scenario = call_llm_for_scenario_plan(
-                        prompt=prompt,
-                        swagger_endpoints=st.session_state.swagger_endpoints,
+                        llm_prompt_input=st.session_state.llm_prompt_text, # Pass the editable prompt from UI
+                        swagger_endpoints=st.session_state.swagger_endpoints, # Will be filtered inside the function
                         db_tables_schema=st.session_state.db_tables_schema,
                         db_sampled_data=st.session_state.db_sampled_data,
                         thread_group_users=st.session_state.num_users_input,
                         ramp_up_time=st.session_state.ramp_up_time_input,
                         loop_count=st.session_state.loop_count_input_specific if st.session_state.loop_count_option == "Specify iterations" else -1,
+                        include_assertions_flag=st.session_state.include_scenario_assertions, # Pass assertions flag
+                        enable_auth_flow_flag=st.session_state.enable_auth_flow, # Pass auth flow flag
                         api_key=st.session_state.gemini_api_key
                     )
                     
@@ -1119,38 +1699,68 @@ def main():
                         st.subheader("AI-Generated JMeter Scenario Details (Streaming)")
                         
                         # Display requests in a streaming fashion
-                        for i, req in enumerate(structured_scenario):
-                            st.markdown(f"**Request {i+1}: {req.get('method')} {req.get('path')}** (Name: `{req.get('name')}`)")
-                            st.write(f"Description: {req.get('description', 'No description provided.')}")
+                        # UPDATED: Adjust display logic for new LLM output structure
+                        if structured_scenario and len(structured_scenario) > 0 and 'test_plan' in structured_scenario[0]:
+                            test_plan_data = structured_scenario[0]['test_plan']
                             
-                            if req.get('parameters_and_body_fields'):
-                                st.markdown("Parameters/Body Fields:")
-                                for param in req['parameters_and_body_fields']:
-                                    source_detail = ""
-                                    if param['source'] == 'from_csv':
-                                        source_detail = f" (from DB CSV: `{param.get('table_name')}.{param.get('column_name')}`)"
-                                    elif param['source'] == 'from_extraction':
-                                        source_detail = f" (from Extraction: request `{param.get('source_request_name')}`, variable `{param.get('extracted_variable_name')}`)"
-                                    elif param['source'] == 'static_value':
-                                        source_detail = f" (Static Value: `{param.get('value')}`)"
-                                    elif param['source'] == 'generate_dummy':
-                                        source_detail = f" (Generated Dummy: type `{param.get('type')}`)"
-                                    st.markdown(f"- `{param.get('name')}` (in `{param.get('in')}`): **`{param['source']}`**{source_detail}")
+                            st.markdown("**Test Plan Overview:**")
+                            st.json(test_plan_data) # Display the full structured response
                             
-                            if req.get('assertions'):
-                                st.markdown("Assertions:")
-                                for ass in req['assertions']:
-                                    st.markdown(f"- Type: `{ass.get('type')}`, Value: `{ass.get('value')}`")
+                            # You might want to extract and display specific parts more clearly
+                            st.markdown("---")
+                            st.markdown(f"**Thread Group:**")
+                            st.write(f"Number of Threads: `{test_plan_data['thread_group']['num_threads']}`")
+                            st.write(f"Ramp-up Time: `{test_plan_data['thread_group']['ramp_up']}`")
+
+                            if 'csv_data_set_config' in test_plan_data:
+                                st.markdown("---")
+                                st.markdown(f"**CSV Data Set Config:**")
+                                st.write(f"Filename: `{test_plan_data['csv_data_set_config']['filename']}`")
+                                st.write(f"Variable Names: `{', '.join(test_plan_data['csv_data_set_config']['variable_names'])}`")
                             
-                            if req.get('extractions'):
-                                st.markdown("Extractions:")
-                                for ext in req['extractions']:
-                                    st.markdown(f"- JSONPath: `{ext.get('json_path')}` -> Var: `{ext.get('var_name')}`")
+                            st.markdown("---")
+                            st.markdown(f"**HTTP Samplers:**")
+                            if 'http_samplers' in test_plan_data and isinstance(test_plan_data['http_samplers'], list):
+                                for i, sampler in enumerate(test_plan_data['http_samplers']):
+                                    st.markdown(f"---")
+                                    st.markdown(f"**Sampler {i+1}: {sampler.get('name', 'Unnamed Sampler')}**")
+                                    st.write(f"Method: `{sampler['method']}`")
+                                    st.write(f"Path: `{sampler['path']}`")
+                                    # Display path_params if present
+                                    if 'path_params' in sampler and sampler['path_params']:
+                                        st.markdown("Path Parameters:")
+                                        for pp in sampler['path_params']:
+                                            st.write(f"- `{pp['name']}`: `{pp['value']}`")
+                                    if 'query_params' in sampler and sampler['query_params']:
+                                        st.markdown("Query Parameters:")
+                                        for qp in sampler['query_params']:
+                                            st.write(f"- `{qp['name']}`: `{qp['value']}`")
+                                    if 'body' in sampler and sampler['body']:
+                                        st.markdown("Body:")
+                                        # Display the body as code, ensure it's a JSON object if parsed
+                                        if isinstance(sampler['body'], (dict, list)):
+                                            st.code(json.dumps(sampler['body'], indent=2))
+                                        else: # It's a string (from LLM) or other primitive
+                                            st.code(str(sampler['body']))
+                                    if 'content_type' in sampler and sampler['content_type']:
+                                        st.write(f"Content Type: `{sampler['content_type']}`")
+                                    if 'headers' in sampler and sampler['headers']:
+                                        st.markdown("Headers:")
+                                        for header in sampler['headers']:
+                                            st.write(f"- `{header['name']}`: `{header['value']}`")
+
+                                    if 'assertions' in sampler and sampler['assertions']:
+                                        st.markdown(f"**Assertions for this Sampler:**")
+                                        for assertion in sampler['assertions']:
+                                            st.write(f"- Type: `{assertion['type']}`, Pattern: `{assertion['pattern']}`")
+
+                                    if 'extractions' in sampler and sampler['extractions']:
+                                        st.markdown(f"**Extractions for this Sampler:**")
+                                        for extraction in sampler['extractions']:
+                                            st.write(f"- JSONPath: `{extraction['json_path']}` -> Var: `{extraction['var_name']}`")
+                            else:
+                                st.info("No HTTP Samplers found in AI-generated design.")
                             
-                            if req.get('think_time_ms') is not None:
-                                st.markdown(f"Think Time: `{req.get('think_time_ms')}` ms")
-                            
-                            st.markdown("---") # Separator for each request
                             time.sleep(0.1) # Simulate streaming delay
                             
                     else:
@@ -1370,7 +1980,7 @@ def main():
                     st.warning(f"Login endpoint {st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path} not found in Swagger spec for manual config. Authentication flow might not work as expected.")
 
 
-            full_swagger_dict = st.session_state.swagger_parser.get_full_swagger_spec()
+            full_swagger_dict = st.session_state.swagger_parser.swagger_data # Use swagger_data directly
             base_path_from_swagger = full_swagger_dict.get('basePath', '/')
             if not base_path_from_swagger.startswith('/'):
                 base_path_from_swagger = '/' + base_path_from_swagger
@@ -1381,9 +1991,13 @@ def main():
                 method_str, path_str = ep_key.split(' ', 1)
                 method_key = method_str.lower()
 
-                resolved_endpoint_data = full_swagger_dict.get('paths', {}).get(path_str, {}).get(method_key, {})
+                # Find the actual SwaggerEndpoint object
+                resolved_endpoint_obj = next((ep for ep in st.session_state.swagger_endpoints if ep.method == method_str and ep.path == path_str), None)
 
-                if resolved_endpoint_data:
+                if resolved_endpoint_obj:
+                    # Use data from the resolved SwaggerEndpoint object
+                    resolved_endpoint_data = resolved_endpoint_obj.to_dict() # Convert back to dict for consistency with old logic
+                    
                     clean_path_name = re.sub(r'[^\w\s-]', '', path_str).replace('/', '_').strip('_')
                     operation_id = resolved_endpoint_data.get('operationId')
                     request_name = f"{method_str}_{operation_id or clean_path_name}"
@@ -1468,7 +2082,7 @@ def main():
                         if resolved_endpoint_data.get('consumes'):
                             content_type_header = resolved_endpoint_data['consumes'][0]
                         elif 'requestBody' in resolved_endpoint_data and 'content' in resolved_endpoint_data['requestBody']:
-                            first_content_type = next(iter(resolved_endpoint_data['requestBody'].get('content', {})), None)
+                            first_content_type = next(iter(content_types.values()), None) # Get content type from requestBody
                             if first_content_type:
                                 content_type_header = first_content_type
                         request_config["headers"]["Content-Type"] = content_type_header
@@ -1610,147 +2224,137 @@ def main():
 
             extracted_variables_map = {}
 
-            full_swagger_dict = st.session_state.swagger_parser.get_full_swagger_spec()
+            full_swagger_dict = st.session_state.swagger_parser.swagger_data # Use swagger_data directly
             base_path_from_swagger = full_swagger_dict.get('basePath', '/')
             if not base_path_from_swagger.startswith('/'):
                 base_path_from_swagger = '/' + base_path_from_swagger
             if base_path_from_swagger != '/' and base_path_from_swagger.endswith('/'):
                 base_path_from_swagger = base_path_from_swagger.rstrip('/')
 
-            for llm_req_design in st.session_state.llm_structured_scenario:
-                method_str = llm_req_design.get('method')
-                path_str = llm_req_design.get('path')
-                request_name = llm_req_design.get('name', f"{method_str}_{path_str.replace('/','_').strip('_')}")
-                think_time = llm_req_design.get('think_time_ms', 0)
+            # UPDATED: The loop now processes a single test_plan object from the LLM response.
+            # structured_scenario is now a list containing one item (the test_plan object)
+            if st.session_state.llm_structured_scenario and len(st.session_state.llm_structured_scenario) > 0 and 'test_plan' in st.session_state.llm_structured_scenario[0]:
+                llm_response_test_plan = st.session_state.llm_structured_scenario[0]['test_plan']
+                
+                # Now http_samplers is a list
+                http_samplers_list = llm_response_test_plan.get('http_samplers', [])
 
-                ep_key = f"{method_str} {path_str}"
-                resolved_endpoint_data = full_swagger_dict.get('paths', {}).get(path_str, {}).get(method_str.lower(), {})
+                for http_sampler in http_samplers_list:
+                    method_str = http_sampler.get('method')
+                    # Use the path directly from LLM, it should be the template path as per new prompt
+                    path_from_llm = http_sampler.get('path') 
+                    request_name = http_sampler.get('name', f"{method_str}_{path_from_llm.replace('/','_').strip('_')}")
+                    think_time = 0 
 
-                if not resolved_endpoint_data:
-                    st.warning(f"AI suggested endpoint {ep_key} not found in Swagger spec. Skipping.")
-                    continue
+                    # UPDATED: Use the new matching function to find the Swagger endpoint
+                    # The LLM is now instructed to provide the template path, so extracted_path_params
+                    # will be empty if LLM follows instructions.
+                    # This function still helps if LLM deviates and gives a concrete path.
+                    resolved_endpoint_obj, _ = _match_swagger_path_with_generated_path(
+                        st.session_state.swagger_endpoints, method_str, path_from_llm
+                    )
 
-                jmeter_formatted_path = path_str
-                request_config = {
-                    "endpoint_key": ep_key,
-                    "name": request_name,
-                    "method": method_str,
-                    "path": "", 
-                    "parameters": {}, 
-                    "headers": {},
-                    "body": None,
-                    "assertions": [],
-                    "json_extractors": [],
-                    "think_time": think_time
-                }
-
-                body_fields_for_recursive_builder = []
-                for param_field in llm_req_design.get('parameters_and_body_fields', []):
-                    param_name = param_field['name']
-                    param_in = param_field['in']
-                    source_strategy = param_field['source']
-                    
-                    resolved_value = None
-
-                    if param_in == 'body':
-                        # For body fields, we collect them and process with the recursive builder
-                        body_fields_for_recursive_builder.append(param_field)
-                        continue # Skip to next param_field, as body is processed later
-                    
-                    if source_strategy == "from_csv":
-                        table_name = param_field.get('table_name')
-                        column_name = param_field.get('column_name')
-                        if table_name and column_name:
-                            resolved_value = f"${{csv_{table_name}_{column_name}}}"
-                        else:
-                            logger.warning(f"LLM suggested 'from_csv' for {param_name} but missing table_name/column_name. Falling back to dummy.")
-                            resolved_value = DataMapper._generate_dummy_value(param_field)
-                    elif source_strategy == "from_extraction":
-                        extracted_var_name = param_field.get('extracted_variable_name')
-                        prefix = param_field.get('prefix', '')
-                        if extracted_var_name in extracted_variables_map:
-                             resolved_value = f"{prefix}{extracted_variables_map[extracted_var_name]}"
-                        else:
-                             logger.warning(f"LLM suggested 'from_extraction' for {param_name} but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
-                             resolved_value = DataMapper._generate_dummy_value(param_field)
-                    elif source_strategy == "generate_dummy":
-                        resolved_value = DataMapper._generate_dummy_value(param_field)
-                    elif source_strategy == "static_value":
-                        resolved_value = param_field.get('value')
-                    
-                    if param_in == 'path':
-                        jmeter_formatted_path = re.sub(r'\{' + re.escape(param_name) + r'\}', str(resolved_value), jmeter_formatted_path)
-                    elif param_in == 'query':
-                        request_config['parameters'][param_name] = str(resolved_value)
-                    elif param_in == 'header':
-                        request_config['headers'][param_name] = str(resolved_value)
-
-
-                final_request_path_for_jmeter = jmeter_formatted_path
-                if base_path_from_swagger != '/' and final_request_path_for_jmeter.startswith(base_path_from_swagger):
-                    final_request_path_for_jmeter = final_request_path_for_jmeter[len(base_path_from_swagger):]
-                    if not final_request_path_for_jmeter.startswith('/'):
-                        final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
-                    if final_request_path_for_jmeter == "//":
-                        final_request_path_for_jmeter = "/"
-                if final_request_path_for_jmeter and not final_request_path_for_jmeter.startswith('/'):
-                    final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
-                request_config["path"] = final_request_path_for_jmeter
-
-                if method_str.lower() in ["post", "put", "patch"]:
-                    content_type_header = "application/json"
-                    if resolved_endpoint_data.get('consumes'):
-                        content_type_header = resolved_endpoint_data['consumes'][0]
-                    elif 'requestBody' in resolved_endpoint_data and 'content' in resolved_endpoint_data['requestBody']:
-                        first_content_type = next(iter(resolved_endpoint_data['requestBody'].get('content', {})), None)
-                        if first_content_type:
-                            content_type_header = first_content_type
-                    request_config["headers"]["Content-Type"] = content_type_header
-
-                    request_body_schema = None
-                    if 'requestBody' in resolved_endpoint_data:
-                        content_types = resolved_endpoint_data['requestBody'].get('content', {})
-                        if content_types:
-                            if 'application/json' in content_types:
-                                request_body_schema = content_types['application/json'].get('schema')
-                            else:
-                                request_body_schema = next(iter(content_types.values())).get('schema')
+                    if not resolved_endpoint_obj:
+                        st.warning(f"AI suggested endpoint {method_str} {path_from_llm} not found in Swagger spec. Skipping.")
+                        continue # Skip this sampler if endpoint not found
                     else:
-                        for param in resolved_endpoint_data.get('parameters', []):
-                            if param.get('in') == 'body' and 'schema' in param:
-                                request_body_schema = param['schema']
-                                break
-                    
-                    if request_body_schema:
-                        try:
-                            generated_body = _build_recursive_json_body_with_llm_guidance(
-                                request_body_schema, 
-                                body_fields_for_recursive_builder,
-                                [], 
-                                extracted_variables_map,
-                                ep_key
-                            )
-                            if isinstance(generated_body, (dict, list, int, float, bool)):
-                                request_config["body"] = json.dumps(generated_body, indent=2)
+                        resolved_endpoint_data = resolved_endpoint_obj.to_dict()
+
+                        # Use the template path from resolved_endpoint_obj for JMeter generation
+                        jmeter_formatted_path = resolved_endpoint_obj.path 
+                        request_config = {
+                            "endpoint_key": f"{method_str} {resolved_endpoint_obj.path}", # Use template path for key
+                            "name": request_name,
+                            "method": method_str,
+                            "path": "", 
+                            "parameters": {}, 
+                            "headers": {}, # Initialize headers here
+                            "body": None,
+                            "assertions": [], # Initialize assertions here
+                            "json_extractors": [],
+                            "think_time": think_time # Use 0 or derive from thread_group later
+                        }
+
+                        # Handle path parameters from LLM response and substitute them into the path
+                        for pp in http_sampler.get('path_params', []):
+                            param_name = pp['name']
+                            param_value = pp['value']
+                            # Replace {param_name} in jmeter_formatted_path with the value provided by LLM
+                            jmeter_formatted_path = jmeter_formatted_path.replace(f"{{{param_name}}}", param_value)
+
+
+                        # Handle query parameters from LLM response
+                        for qp in http_sampler.get('query_params', []):
+                            request_config['parameters'][qp['name']] = qp['value']
+
+                        # Handle headers from LLM response
+                        # Directly assign headers from LLM output
+                        for header in http_sampler.get('headers', []):
+                            request_config['headers'][header['name']] = header['value']
+
+                        # Add authentication header if enabled and not already provided by LLM for this request
+                        # This covers cases where LLM might forget, or if it's a non-login authenticated request
+                        if st.session_state.enable_auth_flow and request_config["endpoint_key"] != f"{st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path}":
+                            auth_header_name_lower = st.session_state.auth_header_name.lower()
+                            # Check if Authorization header is already present (case-insensitive)
+                            if not any(h_name.lower() == auth_header_name_lower for h_name in request_config['headers'].keys()):
+                                if "auth_token" in extracted_variables_map: # Check if the token was successfully extracted
+                                    request_config["headers"][st.session_state.auth_header_name] = f"{st.session_state.auth_header_prefix}{extracted_variables_map['auth_token']}"
+                                else:
+                                    # Fallback for auth token, perhaps a dummy or warning
+                                    request_config["headers"][st.session_state.auth_header_name] = f"{st.session_state.auth_header_prefix}<<AUTH_TOKEN_MISSING>>"
+                                    st.warning(f"Authentication flow enabled for {request_config['endpoint_key']}, but auth token not found or extracted. Using placeholder.")
+
+
+                        # Handle body from LLM response (now it's a string, needs parsing)
+                        if 'body' in http_sampler and http_sampler['body'] is not None:
+                            if isinstance(http_sampler['body'], str):
+                                try:
+                                    # Attempt to parse the body string to JSON object
+                                    request_config["body"] = json.loads(http_sampler['body'])
+                                except json.JSONDecodeError:
+                                    # If it's not a valid JSON string, keep it as is (might be plain text)
+                                    request_config["body"] = http_sampler['body']
                             else:
-                                request_config["body"] = str(generated_body)
-                        except Exception as e:
-                            logger.error(f"Error building recursive JSON body for {ep_key} from LLM design: {e}", exc_info=True)
-                            request_config["body"] = "{\n  \"message\": \"Error building dynamic body from AI design\"\n}"
-                    else:
-                        request_config["body"] = "{\n  \"message\": \"auto-generated dummy body (no schema found for AI design)\"\n}"
+                                # If LLM didn't give a string (e.g. if schema was Object before), use as is
+                                request_config["body"] = http_sampler['body']
+                            
+                            # Ensure content type is set if body is present
+                            if 'content_type' in http_sampler and http_sampler['content_type']:
+                                request_config["headers"]["Content-Type"] = http_sampler['content_type']
+                            elif 'Content-Type' not in request_config['headers']: # Add default if not already set by LLM
+                                request_config["headers"]["Content-Type"] = "application/json" # Default for JSON body
 
-                for assertion_data in llm_req_design.get('assertions', []):
-                    request_config['assertions'].append(assertion_data)
 
-                for extractor_data in llm_req_design.get('extractions', []):
-                    request_config['json_extractors'].append({
-                        "json_path_expr": extractor_data['json_path'],
-                        "var_name": extractor_data['var_name']
-                    })
-                    extracted_variables_map[extractor_data['var_name'].lower()] = f"${{{extractor_data['var_name']}}}"
+                        final_request_path_for_jmeter = jmeter_formatted_path
+                        if base_path_from_swagger != '/' and final_request_path_for_jmeter.startswith(base_path_from_swagger):
+                            final_request_path_for_jmeter = final_request_path_for_jmeter[len(base_path_from_swagger):]
+                            if not final_request_path_for_jmeter.startswith('/'):
+                                final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
+                            if final_request_path_for_jmeter == "//":
+                                final_request_path_for_jmeter = "/"
+                        if final_request_path_for_jmeter and not final_request_path_for_jmeter.startswith('/'):
+                            final_request_path_for_jmeter = '/' + final_request_path_for_jmeter
+                        request_config["path"] = final_request_path_for_jmeter
 
-                llm_designed_configs.append(request_config)
+                        # Handle assertions from LLM response (now specific to this sampler)
+                        for assertion_data in http_sampler.get('assertions', []):
+                            if assertion_data['type'] == 'response_code':
+                                request_config['assertions'].append({"type": "Response Code", "value": assertion_data['pattern']})
+                            elif assertion_data['type'] == 'text_response':
+                                request_config['assertions'].append({"type": "Response Body Contains", "value": assertion_data['pattern']})
+                            else:
+                                request_config['assertions'].append(assertion_data) # Add as is if new type
+
+                        # Handle extractions from LLM response (now specific to this sampler)
+                        for extractor_data in http_sampler.get('extractions', []):
+                            request_config['json_extractors'].append({
+                                "json_path_expr": extractor_data['json_path'],
+                                "var_name": extractor_data['var_name']
+                            })
+                            extracted_variables_map[extractor_data['var_name'].lower()] = f"${{{extractor_data['var_name']}}}"
+
+                        llm_designed_configs.append(request_config)
             
             st.session_state.scenario_requests_configs = llm_designed_configs
             st.success("Scenario configured based on AI design!")
@@ -1758,6 +2362,8 @@ def main():
         st.markdown("---")
         st.subheader("Current Scenario Configuration")
         if st.session_state.scenario_requests_configs:
+            # UPDATED: Display logic for LLM-generated single test plan.
+            # Now, st.session_state.scenario_requests_configs holds a list of requests (could be from LLM or manual).
             for i, config in enumerate(st.session_state.scenario_requests_configs):
                 st.code(f"Request {i+1}: {config['method']} {config['path']} (Name: {config['name']})")
                 with st.expander(f"View Details for {config['name']}"):
@@ -1781,6 +2387,9 @@ def main():
         st.info("Generating JMeter script... Please wait.")
 
         try:
+            # The scenario_plan for JMeterGenerator needs to be a list of individual requests.
+            # st.session_state.scenario_requests_configs already holds this list,
+            # whether it came from LLM processing or manual refinement.
             scenario_plan = {"requests": st.session_state.scenario_requests_configs}
             
             num_users = st.session_state.num_users_input
@@ -1792,29 +2401,57 @@ def main():
             csv_data_for_jmeter = {}
             csv_headers = set()
 
-            for endpoint_key, params_map in st.session_state.mappings.items():
-                for param_name, mapping_info in params_map.items():
-                    if mapping_info['source'] == "DB Sample (CSV)":
-                        # The JMeter variable name format expected by DataMapper is csv_<table_name>_<column_name>
-                        # Ensure this is correctly extracted/formed from mapping_info
-                        if 'table_name' in mapping_info and 'column_name' in mapping_info:
-                            jmeter_var_name_raw = f"csv_{mapping_info['table_name']}_{mapping_info['column_name']}"
-                        else:
-                            # Fallback if table_name or column_name is missing from mapping_info
-                            # This should ideally not happen if DataMapper.suggest_mappings is robust
-                            logger.warning(f"Mapping info for {param_name} (from DB Sample) missing table_name/column_name. Cannot generate CSV.")
-                            continue # Skip this mapping for CSV generation
+            # UPDATED: How CSV data is identified now needs to come from the `csv_data_set_config` from the LLM.
+            # The existing `st.session_state.mappings` logic still applies for manual refinement,
+            # but for LLM-generated output, we prefer the LLM's `csv_data_set_config`.
+            if st.session_state.llm_structured_scenario and len(st.session_state.llm_structured_scenario) > 0 and 'test_plan' in st.session_state.llm_structured_scenario[0]:
+                llm_csv_config = st.session_state.llm_structured_scenario[0]['test_plan'].get('csv_data_set_config')
+                if llm_csv_config and llm_csv_config.get('variable_names'):
+                    # Assume LLM variable names are in the format table_column for now
+                    # This might need refinement based on how LLM actually names them.
+                    for var_name_from_llm_csv_config in llm_csv_config['variable_names']:
+                        # The user examples use 'clientId', 'appCD' directly as variable names.
+                        # We need to map these back to actual database table.column if possible.
+                        # This part of the integration is critical and may need further LLM refinement or manual mapping.
+                        # For now, let's try to infer if they correspond to sampled data.
+                        
+                        found_match = False
+                        # Try to find a match in sampled data using flexible matching
+                        for table_name, df in st.session_state.db_sampled_data.items():
+                            for col_name in df.columns:
+                                # Prioritize exact match or case-insensitive match
+                                if var_name_from_llm_csv_config.lower() == f"{table_name.lower()}_{col_name.lower()}": # Match table_column format
+                                    jmeter_var_name_raw = f"csv_{table_name}_{col_name}"
+                                    if jmeter_var_name_raw not in csv_data_for_jmeter:
+                                        csv_data_for_jmeter[jmeter_var_name_raw] = df[col_name].tolist()
+                                        csv_headers.add(jmeter_var_name_raw)
+                                    found_match = True
+                                    break # Found a column for this var_name
+                            if found_match:
+                                break # Found a table for this var_name
+                        
+                        if not found_match:
+                            logger.warning(f"LLM suggested CSV variable '{var_name_from_llm_csv_config}' in csv_data_set_config but no direct or inferred match found in sampled database columns for CSV generation. This variable might not be correctly populated in CSV.")
 
-
-                        if mapping_info['table_name'] in st.session_state.db_sampled_data and \
-                           mapping_info['column_name'] in st.session_state.db_sampled_data[mapping_info['table_name']].columns:
-                            
-                            if jmeter_var_name_raw not in csv_data_for_jmeter:
-                                csv_data_for_jmeter[jmeter_var_name_raw] = st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']].tolist()
-                                csv_headers.add(jmeter_var_name_raw)
+            else: # Fallback to existing logic if LLM didn't provide new structure
+                for endpoint_key, params_map in st.session_state.mappings.items():
+                    for param_name, mapping_info in params_map.items():
+                        if mapping_info['source'] == "DB Sample (CSV)":
+                            if 'table_name' in mapping_info and 'column_name' in mapping_info:
+                                jmeter_var_name_raw = f"csv_{mapping_info['table_name']}_{mapping_info['column_name']}"
                             else:
-                                if len(csv_data_for_jmeter[jmeter_var_name_raw]) < len(st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']]):
+                                logger.warning(f"Mapping info for {param_name} (from DB Sample) missing table_name/column_name. Cannot generate CSV.")
+                                continue
+
+                            if mapping_info['table_name'] in st.session_state.db_sampled_data and \
+                               mapping_info['column_name'] in st.session_state.db_sampled_data[mapping_info['table_name']].columns:
+                                
+                                if jmeter_var_name_raw not in csv_data_for_jmeter:
                                     csv_data_for_jmeter[jmeter_var_name_raw] = st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']].tolist()
+                                    csv_headers.add(jmeter_var_name_raw)
+                                else:
+                                    if len(csv_data_for_jmeter[jmeter_var_name_raw]) < len(st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']]):
+                                        csv_data_for_jmeter[jmeter_var_name_raw] = st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']].tolist()
 
 
             generated_csv_content = None
@@ -1851,7 +2488,7 @@ def main():
                     base_path_for_http_defaults = '/' + base_path_for_http_defaults
                 if base_path_for_http_defaults != '/' and base_path_for_http_defaults.endswith('/'):
                     base_path_for_http_defaults = base_path_for_http_defaults.rstrip('/')
-                current_full_swagger_spec_dict = st.session_state.swagger_parser.get_full_swagger_spec()
+                current_full_swagger_spec_dict = st.session_state.swagger_parser.swagger_data # Use swagger_data directly
             else: # Fallback if swagger_parser is not set or data missing
                 parsed_url = urlparse(swagger_url) # Use the input URL as fallback
                 protocol = parsed_url.scheme
@@ -3294,9 +3931,6 @@ if __name__ == "__main__":
                 "approved",
                 "delivered"
               ]
-            },
-            "complete": {
-              "type": "boolean"
             }
           },
           "xml": {
