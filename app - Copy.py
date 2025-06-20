@@ -20,7 +20,7 @@ sys.set_int_max_str_digits(0) # 0 means unlimited
 # Add utils to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'utils'))
 
-from utils.jmeter_generator import JMeterScriptGenerator # Import the class
+from utils.jmeter_generator import JMeterScriptGenerator
 from utils.database_connector import DatabaseConnector, DatabaseConfig
 from utils.swagger_parser import SwaggerParser, SwaggerEndpoint # Import SwaggerEndpoint
 from utils.data_mapper import DataMapper
@@ -77,184 +77,116 @@ def _clean_url_string(url_string: str) -> str:
 
 def _repair_truncated_json(json_string: str) -> str:
     """
-    Attempts to repair a truncated or malformed JSON string by iteratively trimming
-    from the end and adding common missing closing characters.
-    Also attempts to escape unescaped internal quotes and newlines within string contexts,
-    and handles specific cases of problematic backslashes.
+    Attempts to repair a truncated JSON string by appending missing closing characters.
+    This is a heuristic and might not fix all cases, but addresses common truncation issues
+    like unterminated strings or incomplete objects/arrays.
     """
-    stripped_string = json_string.strip() # Start with stripping whitespace
-
-    # --- Initial Cleanup: Aggressively extract the main JSON block ---
-    # Find the first occurrence of '{' or '[' and the last '}' or ']'
-    json_start_match = re.search(r'[\{\[]', stripped_string)
-    json_end_match = re.search(r'[\}\]]', stripped_string[::-1]) # Search reversed string
-
-    if json_start_match and json_end_match:
-        start_index = json_start_match.start()
-        end_index = len(stripped_string) - json_end_match.start()
-        stripped_string = stripped_string[start_index:end_index]
-        logger.debug(f"Trimmed to potential JSON block: {stripped_string[:200]}...")
-
-    # Strip markdown fences again, in case they were inside the extracted block
-    if stripped_string.startswith("```json"):
-        stripped_string = stripped_string[7:]
-    if stripped_string.endswith("```"):
-        stripped_string = stripped_string[:-3]
-    stripped_string = stripped_string.strip() # Re-strip after markdown removal
-
-
-    # --- Step 1: Pre-process for common JSON string literal issues ---
-    # This loop attempts to fix unescaped newlines, unescaped quotes, and
-    # problematic backslashes within what *should be* JSON string values.
-    processed_chars = []
-    in_string = False
-    i = 0
-    while i < len(stripped_string):
-        char = stripped_string[i]
-
-        if char == '\\':
-            # Handle potential escape sequences. If it's a valid JSON escape, append as is.
-            # Otherwise, escape the backslash itself.
-            if i + 1 < len(stripped_string):
-                next_char = stripped_string[i+1]
-                # Common JSON valid escape characters
-                if next_char in ['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u']:
-                    processed_chars.append(char)
-                    processed_chars.append(next_char)
-                    i += 1 # Skip next char
-                else:
-                    # Not a standard JSON escape, escape the backslash itself if in a string
-                    if in_string:
-                        processed_chars.append('\\\\')
-                    else:
-                        processed_chars.append(char) # Outside string, keep as is for now
-            else:
-                # Dangling backslash at the very end, escape it
-                if in_string:
-                    processed_chars.append('\\\\')
-                else:
-                    processed_chars.append(char)
-        elif char == '"':
-            # Determine if this quote is a string delimiter or an unescaped internal quote.
-            # An unescaped quote within a string needs to be escaped.
-            # A quote following an odd number of backslashes is already escaped.
-            j = i - 1
-            backslashes_count = 0
-            while j >= 0 and stripped_string[j] == '\\':
-                backslashes_count += 1
-                j -= 1
-            
-            if backslashes_count % 2 == 0: # This quote is NOT escaped
-                if in_string: # We are inside a string, so this is an unescaped internal quote
-                    processed_chars.append('\\"') # Escape it
-                else: # We are outside a string, so this is a string delimiter
-                    processed_chars.append(char)
-                    in_string = not in_string # Toggle state
-            else: # This quote IS escaped by preceding backslashes
-                processed_chars.append(char) # Keep it as is (already escaped in source)
-        elif in_string:
-            # Inside a string, escape control characters and other problematic ones
-            if char == '\n':
-                processed_chars.append('\\n')
-            elif char == '\r':
-                processed_chars.append('\\r')
-            elif char == '\t':
-                processed_chars.append('\\t')
-            elif char == '`': # Backticks are not standard JSON, escape them
-                processed_chars.append('\\`')
-            elif ord(char) < 32: # Escape other non-printable ASCII control characters
-                processed_chars.append(f'\\u{ord(char):04x}')
-            else:
-                processed_chars.append(char)
-        else:
-            # Not in a string, not a backslash or quote, append as is
-            processed_chars.append(char)
-        i += 1
+    stripped_string = json_string.strip()
     
-    repaired_output = "".join(processed_chars)
-    logger.debug(f"After string literal pre-processing: {repaired_output}")
+    # 1. Remove markdown fences, if any (should ideally be handled before this, but as a safeguard)
+    if stripped_string.startswith("```json"):
+        stripped_string = stripped_string[len("```json"):].strip()
+    if stripped_string.endswith("```"):
+        stripped_string = stripped_string[:-len("```")].strip()
 
-    # If after processing, we are still conceptually "in a string", close it.
-    # This handles cases where the entire JSON string might have been truncated mid-string.
-    if in_string and not repaired_output.endswith('"'): # Check if the last char is not a quote
-        repaired_output += '"'
-        logger.debug(f"Appended missing closing quote: {repaired_output}")
-
-    # --- Step 2: Attempt to parse. If successful, return. ---
+    # Try to parse the string as is. If it succeeds, return.
     try:
-        json.loads(repaired_output)
-        logger.debug("Successfully parsed after string literal repair.")
-        return repaired_output
-    except json.JSONDecodeError as e:
-        logger.debug(f"Still failing after string literal repair: {e}. Proceeding with structural repair.")
-        pass # Continue with structural repair
+        json.loads(stripped_string)
+        return stripped_string
+    except json.JSONDecodeError:
+        pass # Continue with repair
 
-    # --- Step 3: Structural Repair (balancing brackets and braces) and Final Trimming ---
-    max_trim_attempts = 100 # Safety limit to prevent infinite loops
-    for attempt in range(max_trim_attempts):
+    # Track open characters and string state more carefully
+    open_stack = [] # Use a stack for {'[':']', '{':'}'}
+    in_string = False
+    repaired_chars = []
+    
+    for char in stripped_string:
+        if char == '"':
+            # Toggle in_string state if it's not an escaped quote
+            if not in_string or (in_string and repaired_chars and repaired_chars[-1] != '\\'):
+                in_string = not in_string
+        elif not in_string: # Only consider structural characters if not inside a string
+            if char == '[':
+                open_stack.append('[')
+            elif char == '{':
+                open_stack.append('{')
+            elif char == ']':
+                if open_stack and open_stack[-1] == '[':
+                    open_stack.pop()
+                # else: Mismatched or extra closing bracket, ignore for now, rely on final balancing
+            elif char == '}':
+                if open_stack and open_stack[-1] == '{':
+                    open_stack.pop()
+                # else: Mismatched or extra brace, ignore for now
+        repaired_chars.append(char)
+
+    repaired_output = "".join(repaired_chars)
+
+    # If the string was unterminated, close it
+    if in_string:
+        repaired_output += '"'
+
+    # Remove trailing commas that would cause parsing errors
+    while repaired_output and repaired_output.endswith(','):
+        # Only remove if the comma is immediately before a structural closer or end of string
+        # e.g., "key": "value", -- valid in an object before another key or '}'
+        # { "key": "value", -- invalid if followed by } or ]
+        # This logic is complex. A simpler approach is to remove if it immediately precedes end or a bracket/brace.
+        
+        # Check if the comma is indeed problematic (e.g., not followed by a valid JSON element start)
+        # This is a heuristic and might need further refinement for edge cases
+        if repaired_output.endswith((']', '}')): # Trailing comma right before a closer, e.g. [1, ] or {"a":1,}
+             # Find last non-whitespace, non-comma char
+            last_valid_char_idx = len(repaired_output) - 1
+            while last_valid_char_idx >= 0 and repaired_output[last_valid_char_idx] in [',', ' ', '\n', '\r', '\t']:
+                last_valid_char_idx -= 1
+            if last_valid_char_idx >= 0 and repaired_output[last_valid_char_idx] in ['[', '{']:
+                repaired_output = repaired_output[:last_valid_char_idx + 1] # Trim from the comma
+            else:
+                repaired_output = repaired_output[:-1] # Remove just the last comma if no structural issue immediately before
+        else:
+            break # No more problematic commas at the end
+    
+    # Append missing closing characters based on the stack
+    # Reverse the stack to close in correct order (innermost first)
+    for opener in reversed(open_stack):
+        if opener == '[':
+            repaired_output += ']'
+        elif opener == '{':
+            repaired_output += '}'
+
+    # Final aggressive trim for very malformed endings (e.g., `,}]` or `]]}}`)
+    # This loop tries to make the JSON parsable even if it means losing some trailing data
+    # It attempts to iteratively trim until it's parsable or no further simple trimming helps.
+    for _ in range(5): # Limit attempts to prevent infinite loop
         try:
             json.loads(repaired_output)
-            logger.debug(f"JSON successfully parsed after {attempt} final trims.")
-            return repaired_output
+            break # Successfully parsed, stop
         except json.JSONDecodeError as e:
-            logger.debug(f"JSONDecodeError during final trim attempt {attempt}: {e}. Current length: {len(repaired_output)}")
-            
-            # Specific handling for "Expecting ',' delimiter" and other syntax errors
-            if e.pos is not None and e.pos < len(repaired_output):
-                # Aggressively truncate the string just before the problematic character
-                # This is a heuristic to cut off the source of the delimiter/syntax error
-                repaired_output = repaired_output[:e.pos]
-                logger.warning(f"Truncated string at error position {e.pos} due2 to JSON syntax issue. New length: {len(repaired_output)}")
-                
-                # After truncation, re-balance structural elements for the new shorter string
-                temp_stack = []
-                for char_val in repaired_output:
-                    if char_val == '{': temp_stack.append('{')
-                    elif char_val == '[': temp_stack.append('[')
-                    # Only pop if matching opener is found, otherwise it's an extraneous closer in the truncated part
-                    elif char_val == '}':
-                        if temp_stack and temp_stack[-1] == '{': temp_stack.pop()
-                    elif char_val == ']':
-                        if temp_stack and temp_stack[-1] == '[': temp_stack.pop()
-                
-                # Append missing closers
-                for opener in reversed(temp_stack):
-                    if opener == '{': repaired_output += '}'
-                    elif opener == '[': repaired_output += ']'
-                logger.debug(f"Re-balanced after truncation for syntax error. New end: {repaired_output[-50:] if len(repaired_output) > 50 else repaired_output}")
-                
-                # Try parsing again immediately with the modified string
-                continue 
-
-            # Fallback general trimming if e.pos is not useful or after targeted truncation
-            original_len = len(repaired_output)
-            
-            if not repaired_output: # Handle empty string after previous truncations
-                 logger.debug("Repaired output is empty, cannot trim further.")
-                 break
-            
-            # Attempt to remove common problematic trailing characters
-            if repaired_output.endswith((',', '[', '{', ':', '\\', '"', '`')):
-                repaired_output = repaired_output.rstrip(',[:{\\"`')
-                logger.debug(f"Trimmed problematic trailing non-structural chars. New end: {repaired_output[-50:] if len(repaired_output) > 50 else repaired_output}")
-            elif original_len > 1 and repaired_output[-2] == ',' and repaired_output.endswith(('}', ']')):
-                # Handle trailing comma just before a valid closing bracket/brace
-                repaired_output = repaired_output[:-2] + repaired_output[-1] # Remove comma, keep closer
-                logger.debug(f"Trimmed trailing comma before closer. New end: {repaired_output[-50:] if len(repaired_output) > 50 else repaired_output}")
-            elif repaired_output.endswith((' ', '\n', '\r', '\t')):
-                repaired_output = repaired_output.rstrip(' \n\r\t')
-                logger.debug(f"Trimmed trailing whitespace. New end: {repaired_output[-50:] if len(repaired_output) > 50 else repaired_output}")
-            else:
-                # Last resort: remove one character if no specific pattern matched and it's still invalid
-                if repaired_output: # Ensure string is not empty before slicing
-                    repaired_output = repaired_output[:-1]
-                logger.debug(f"General one-char trim. New end: {repaired_output[-50:] if len(repaired_output) > 50 else repaired_output}")
-
-            if len(repaired_output) == original_len:
-                logger.debug("No further progress in trimming. Breaking.")
+            if not repaired_output: # Nothing left to trim
                 break
-
-    logger.warning("Failed to fully repair JSON after multiple attempts. Returning best effort string.")
+            # Attempt to strip characters that are common causes of syntax errors at the end
+            # This is a bit of a brute-force approach but effective for truncation
+            if repaired_output.endswith(('"', "'", ',', '[', '{', ':', '\\')):
+                repaired_output = repaired_output[:-1]
+            elif repaired_output.endswith(']}') and not open_stack: # if it looks like ]} but stack is empty, it'd malformed
+                 repaired_output = repaired_output[:-2] # trim both
+            elif repaired_output.endswith(']}') and len(open_stack) == 1 and open_stack[0] == '[': # if it's ]} and only [ is open, then it's probably malformed and we need to fix
+                 repaired_output = repaired_output[:-1] # trim }
+            elif repaired_output.endswith(']'):
+                if open_stack and open_stack[-1] == '[':
+                    repaired_output = repaired_output[:-1] # let the stack handle it
+                elif not open_stack:
+                    repaired_output = repaired_output[:-1] # Remove extra closing bracket
+            elif repaired_output.endswith('}'):
+                if open_stack and open_stack[-1] == '{':
+                    repaired_output = repaired_output[:-1] # let the stack handle it
+                elif not open_stack:
+                    repaired_output = repaired_output[:-1] # Remove extra closing brace
+            else:
+                break # Can't fix further by simple trimming
+            
     return repaired_output
 
 
@@ -307,21 +239,19 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
                                loop_count: int,
                                include_assertions_flag: bool,
                                enable_auth_flow_flag: bool,
-                               api_key: str) -> Optional[Dict[str, Any]]: # This function returns structured JSON
-    """
-    Calls the LLM API to get a structured JSON scenario plan.
-    """
+                               api_key: str) -> Optional[Dict[str, Any]]: # Changed return type to Dict
+
     import json
     import re
     import requests
 
-    # Gemini Flash API URL
+    # ✅ Gemini Flash API URL
     protocol_segment = "https://"
     domain_segment = "generativelanguage.googleapis.com"
     path_segment = "/v1beta/models/gemini-2.0-flash:generateContent?key="
     api_url = f"{protocol_segment}{domain_segment}{path_segment}{api_key}"
 
-    # Step 1: Match endpoints from prompt
+    # ✅ Step 1: Match endpoints from prompt
     specific_endpoint_patterns = re.findall(r'(?i)(get|post|put|delete|patch)\s*\n?\s*([/\w\-{{}}]+)', llm_prompt_input)
     filtered_swagger_endpoints = []
 
@@ -334,12 +264,12 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
         filtered_swagger_endpoints = swagger_endpoints
         st.warning("⚠️ No specific match found in Swagger. Using all available endpoints.")
 
-    # Step 2: Generate DB param mappings
+    # ✅ Step 2: Generate DB param mappings
     suggested_mappings = DataMapper.suggest_mappings(
         filtered_swagger_endpoints, db_tables_schema, db_sampled_data
     )
 
-    # Step 3: Trim large context inputs
+    # ✅ Step 3: Trim large context inputs
     swagger_summary = json.dumps([ep.to_dict() for ep in filtered_swagger_endpoints], indent=2)[:15000]
     db_schema_summary = json.dumps(db_tables_schema, indent=2)[:8000]
     sampled_data_summary = json.dumps({
@@ -347,9 +277,9 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
     }, indent=2)[:5000]
     suggested_mapping_summary = json.dumps(suggested_mappings, indent=2)[:5000]
 
-    # The prompt for LLM to generate structured JSON scenario
-    final_llm_prompt_for_json_output = (
-        f"{llm_prompt_input}\n\n" # This will include the user's base prompt
+    # ✅ Step 4: Build final prompt for JMeter-style JSON structure
+    final_llm_prompt = (
+        f"{llm_prompt_input}\n\n"
         f"### 🔍 Input Context:\n"
         f"- Swagger Endpoints:\n{swagger_summary}\n\n"
         f"- Database Schema:\n{db_schema_summary}\n\n"
@@ -378,10 +308,10 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
                 - Secrets (e.g., `clientSecret`, `secretValue`)
                 - Any other unique identifier or key field (e.g., `portalCd`, `schemeId`, `status`, `trackingId`)
 
-            - If such fields are present in the response JSON, you **must include an `extractions` array** inside that same `http_sampler`.
+            - If such fields are present in the response JSON, you **must include an `extractors` array** inside that same `http_sampler`.
 
             - Use this format:
-            "extractions": [
+            "extractors": [
               {{
                 "type": "json_path",
                 "expression": "$.fieldName",
@@ -394,14 +324,28 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
             - It is okay if the extracted value is **not used immediately or not reused at all** — still include it.
             - Use the extracted variable in subsequent requests **only when applicable** by referencing `${{fieldName}}`.
             - **Do not duplicate extractors** for the same field in multiple samplers.
+
+            ⚠️ IMPORTANT:
+            - Extractor variable names **must be unique across the entire test plan**.
+            - Do not reuse the same variable name (e.g., `message`, `client_secret`, `ApplicationCD`) across different samplers.
+            - If a variable is extracted from multiple samplers, make each one unique by prefixing/suffixing based on context.
+            - ✅ Example:
+                Instead of this:
+                "variable": "message"
+                "variable": "message"
+
+                Do this:
+                "variable": "client_creation_message"
+                "variable": "appcd_details_message"
+
             - Always prefer contextual names like:
                 - `detailsbyappcd_ApplicationCD`
                 - `clientApi_LegacyClientCD`
                 - `secrets_api_client_secret`
         """
         f"""### ♻️ Variable Extraction and Reuse Guidelines:
-            - If a sampler returns a field like `clientId`, `authToken`, `mappingId`, `applicationCd`, etc., extract it and save it into a variable using `extractions`.
-            - Store it using `"extractions"` inside the **same http_sampler** object.
+            - If a sampler returns a field like `clientId`, `authToken`, `mappingId`, `applicationCd`, etc., extract it and save it into a variable using `extractors`.
+            - Store it using `"extractors"` inside the **same http_sampler** object.
             - Once extracted, use the variable using `${{variable}}` syntax in any **future request**, even if it's not the immediate next one.
             - The variable may be used:
                 - Immediately (in the next request)
@@ -411,7 +355,7 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
                 - Use descriptive variable names (e.g., `clientId`, `auth_token`, `mappingId`) and maintain consistency.
                 ✅ Example usage:
                 1. Extract token in login response:
-                "extractions": [{{"type": "json_path", "expression": "$.token", "variable": "auth_token"}}]"""
+                "extractors": [{{"type": "json_path", "expression": "$.token", "variable": "auth_token"}}]"""
         "\n\n"
         "### ✅ Expected Output:\n"
         "Return ONLY a valid JSON object in the following format:\n"
@@ -430,14 +374,17 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
         "        \"name\": \"PUT /v1/update-client\",\n"
         "        \"method\": \"PUT\",\n"
         "        \"path\": \"/v1/update-client\",\n"
-        "        \"body\": \"{\\\"clientId\\\": \\\"${clientId}\\\", \\\"newName\\\": \\\"${newName}\\\"}\",\n"
+        "        \"body\": {\n"
+        "          \"clientId\": \"${clientId}\",\n"
+        "          \"newName\": \"${newName}\"\n"
+        "        },\n"
         "        \"content_type\": \"application/json\",\n"
         "        \"headers\": [\n"
         "          {\"name\": \"Authorization\", \"value\": \"Bearer ${auth_token}\"},\n"
         "          {\"name\": \"Content-Type\", \"value\": \"application/json\"}\n"
         "        ],\n"
-        "        \"extractions\": [\n"
-        "          {\"json_path\": \"$.clientId\", \"var_name\": \"update_client_clientId\"}\n"
+        "        \"extractors\": [\n"
+        "          {\"type\": \"json_path\", \"expression\": \"$.clientId\", \"variable\": \"update_client_clientId\"}\n"
         "        ],\n"
         "        \"assertions\": [\n"
         "          {\"type\": \"response_code\", \"pattern\": \"200\"},\n"
@@ -451,14 +398,13 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
         "- It must contain at least a response code assertion like:\n"
         "  {\"type\": \"response_code\", \"pattern\": \"200\"}\n\n"
         "✅ Place this \"assertions\" array INSIDE each http_sampler, not as a global field.\n"
-        "- **Double Quotes for Property Names**: ALL property names (keys) MUST be enclosed in double quotes (e.g., `\"name\": \"value\"`, NOT `name: \"value\"`).\n"
         "DO NOT include markdown code blocks. Respond only with pure JSON object.\n"
     )
 
     payload = {
         "contents": [
             {
-                "parts": [{"text": final_llm_prompt_for_json_output}], # Use the JSON-focused prompt
+                "parts": [{"text": final_llm_prompt}],
                 "role": "user"
             }
         ]
@@ -468,12 +414,14 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
         "Content-Type": "application/json"
     }
 
+    # ✅ Step 5: Send API request
     try:
         response = requests.post(api_url, headers=headers, json=payload)
         response.raise_for_status()
         gemini_output = response.json()
         response_text = gemini_output.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
 
+        # ✅ Debug log
         if not response_text:
             st.error("❌ Gemini returned empty output. Try reducing Swagger size or simplify the prompt.")
             return None
@@ -481,285 +429,34 @@ def call_llm_for_scenario_plan(llm_prompt_input: str,
         st.info("ℹ️ Gemini raw response:")
         st.code(response_text, language="json")
 
-        # Strip markdown if present
+        # ✅ Strip markdown if present
         if response_text.startswith("```json"):
             response_text = response_text[7:]
         if response_text.endswith("```"):
             response_text = response_text[:-3]
 
-        # Parse JSON and validate structure
+        # ✅ Parse JSON and validate structure
         try:
-            # First attempt to parse directly
             test_plan_obj = json.loads(response_text)
             if isinstance(test_plan_obj, dict) and "test_plan" in test_plan_obj:
                 st.success("✅ Parsed JMeter-style test plan from Gemini.")
                 return test_plan_obj # Return the dictionary directly
             else:
-                st.error("⚠️ LLM output does not contain a valid 'test_plan' structure after initial parse.")
+                st.error("⚠️ LLM output does not contain a valid 'test_plan' structure.")
                 st.code(response_text)
                 return None
         except json.JSONDecodeError as e:
-            st.warning(f"Initial JSON parsing failed with: {e}. Attempting repair...")
-            logger.warning(f"Initial JSON parsing failed with: {e}. Raw response text (truncated for log): {response_text[:500]}...")
-
-            repaired_response_text = _repair_truncated_json(response_text)
-
-            try:
-                test_plan_obj = json.loads(repaired_response_text)
-                if isinstance(test_plan_obj, dict) and "test_plan" in test_plan_obj:
-                    st.session_state.llm_structured_scenario = test_plan_obj # Set session state on successful repair
-                    st.success("✅ Parsed JMeter-style test plan from Gemini after repair.")
-                    return test_plan_obj
-                else:
-                    st.error("⚠️ LLM output does not contain a valid 'test_plan' structure even after repair.")
-                    st.code(repaired_response_text)
-                    return None
-            except json.JSONDecodeError as repair_e:
-                st.error("❌ JSON parsing failed even after repair.")
-                st.code(repaired_response_text) # Show the result of the repair attempt
-                st.exception(repair_e) # Show the new error if repair failed
-                return None
+            st.error("❌ JSON parsing failed.")
+            st.code(response_text)
+            st.exception(e)
+            return None
 
     except requests.RequestException as e:
         st.error(f"❌ Gemini API call failed: {str(e)}")
         return None
 
-def _build_recursive_json_body_with_llm_guidance(
-    schema: Dict[str, Any], 
-    llm_param_fields: List[Dict[str, Any]], # LLM's suggested parameter/body field sourcing
-    current_path_segments: List[str], 
-    extracted_vars: Dict[str, str], # Already JMeter variable format
-    endpoint_key: str # For DataMapper calls if needed
-) -> Any:
-    """
-    Recursively builds a JSON body (or part of it) based on schema definitions,
-    prioritizing LLM-suggested sourcing strategies and integrating extracted variables
-    and DataMapper for CSV/dummy generation.
-    """
-    logger.debug(f"Entering _build_recursive_json_body_with_llm_guidance with: {'.'.join(current_path_segments)}, schema_type: {schema.get('type')}")
-
-    if not isinstance(schema, dict):
-        logger.debug(f"Schema is not a dictionary: {schema}. Returning as is.")
-        return schema 
-
-    schema_type = schema.get('type', 'object') 
-
-    if schema_type == 'object':
-        body_obj = {}
-        properties = schema.get('properties', {})
-        
-        for prop_name, prop_details in properties.items():
-            full_param_name_dot_path = ".".join(current_path_segments + [prop_name])
-            
-            # Find LLM's explicit instruction for this specific field
-            # For body fields, the 'name' in LLM instruction should match the full_param_name_dot_path
-            llm_instruction = next((item for item in llm_param_fields if item.get('name') == full_param_name_dot_path and item.get('in') == 'body'), None)
-
-            value_set = False
-
-            if llm_instruction:
-                source = llm_instruction.get("source")
-                if source == "from_csv":
-                    table_name = llm_instruction.get("table_name")
-                    column_name = llm_instruction.get("column_name")
-                    # PRIORITIZE table_name and column_name for from_csv, ignore 'value' from LLM if present
-                    if table_name and column_name:
-                        jmeter_var = f"${{csv_{table_name}_{column_name}}}"
-                        body_obj[prop_name] = jmeter_var
-                        value_set = True
-                        logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM CSV instruction: {jmeter_var}")
-                    else:
-                        # Fallback if table_name or column_name is missing for from_csv
-                        logger.warning(f"LLM suggested 'from_csv' for {full_param_name_dot_path} but missing table_name/column_name. Falling back to dummy.")
-                        body_obj[prop_name] = DataMapper._generate_dummy_value(llm_instruction)
-                        value_set = True
-                elif source == "from_extraction":
-                    extracted_var_name = llm_instruction.get("extracted_variable_name")
-                    prefix = llm_instruction.get("prefix", "")
-                    if extracted_var_name in extracted_vars: # Check if the extracted variable is available
-                            resolved_value = f"{prefix}{extracted_vars[extracted_var_name]}"
-                            body_obj[prop_name] = resolved_value
-                            value_set = True
-                            logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM extraction instruction: {resolved_value}")
-                    else:
-                            logger.warning(f"LLM suggested 'from_extraction' for {prop_name} but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
-                            body_obj[prop_name] = DataMapper._generate_dummy_value(llm_instruction) # Use llm_instruction as it contains schema details
-                            value_set = True
-                elif source == "static_value":
-                    body_obj[prop_name] = llm_instruction.get("value")
-                    value_set = True
-                    logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM static instruction: {llm_instruction.get('value')}")
-                elif source == "generate_dummy":
-                    body_obj[prop_name] = DataMapper._generate_dummy_value(llm_instruction) # Pass LLM instruction which has swagger details
-                    value_set = True
-                    logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM dummy instruction: {body_obj[prop_name]}")
-            
-            # If LLM didn't provide specific instruction or it failed, fall back
-            if not value_set:
-                # Recursively build for nested objects/arrays
-                if prop_details.get('type') == 'object':
-                    body_obj[prop_name] = _build_recursive_json_body_with_llm_guidance(
-                        prop_details, llm_param_fields, current_path_segments + [prop_name], extracted_vars, endpoint_key
-                    )
-                    logger.debug(f"Body field '{full_param_name_dot_path}' populated by recursive call (object).")
-                elif prop_details.get('type') == 'array':
-                    if 'items' in prop_details:
-                        array_item_path_segments = current_path_segments + [prop_name, "_item"]
-                        
-                        item_schema = prop_details['items'] # Get the schema for array items
-                        
-                        generated_item = _build_recursive_json_body_with_llm_guidance(
-                            item_schema, llm_param_fields, array_item_path_segments, extracted_vars, endpoint_key
-                        )
-                        body_obj[prop_name] = [generated_item] # Generate one item for the array as a sample
-                        logger.debug(f"Body field '{full_param_name_dot_path}' (array) populated with one recursive item: {body_obj[prop_name]}")
-                    else:
-                        body_obj[prop_name] = [] # Empty array if no items schema
-                        logger.debug(f"Body field '{full_param_name_dot_path}' (array) populated as empty (no item schema).")
-                else: # Primitive type (string, integer, boolean, number etc.)
-                    # Fallback to DataMapper's default dummy generation if no LLM instruction or other source
-                    body_obj[prop_name] = DataMapper._generate_dummy_value(prop_details) # Pass prop_details for smarter dummy generation
-                    logger.debug(f"Body field '{full_param_name_dot_path}' (primitive, fallback) populated with dummy: {body_obj[prop_name]}")
-
-        return body_obj
-    
-    elif schema_type == 'array':
-        logger.debug(f"Schema is an array. Path: {'.'.join(current_path_segments)}")
-        # Find LLM's explicit instruction for the root array itself (if body is an array)
-        root_array_full_path = ".".join(current_path_segments)
-        llm_instruction = next((item for item in llm_param_fields if item.get('name') == root_array_full_path and item.get('in') == 'body'), None)
-
-        if llm_instruction and llm_instruction.get("source") == "static_value":
-            try:
-                return json.loads(llm_instruction.get("value")) # Assume static value for array is a JSON string of array
-            except json.JSONDecodeError:
-                logger.warning(f"Static value for array body at {root_array_full_path} is not valid JSON array: {llm_instruction.get('value')}")
-                return []
-        
-        if 'items' in schema:
-            # Generate a single item for the array as a sample based on its item schema
-            generated_item = _build_recursive_json_body_with_llm_guidance(
-                schema['items'], llm_param_fields, current_path_segments + ["_item"], extracted_vars, endpoint_key
-            )
-            logger.debug(f"Root array body populated with one recursive item: {generated_item}")
-            return [generated_item]
-        else:
-            logger.debug("Root array body populated as empty (no item schema).")
-            return [] 
-
-    # Handle primitive types directly at the current level (e.g., if body is just a string or integer)
-    elif schema_type in ['string', 'integer', 'boolean', 'number']:
-        # Corrected f-string: removed extra single quote
-        logger.debug(f"Schema is a primitive type: {schema_type}. Path: {'.'.join(current_path_segments)}")
-        # For root-level primitive body, LLM instruction's name should match current_path_segments (empty string for root)
-        root_primitive_name = ".".join(current_path_segments) if current_path_segments else "" # For root body, name ""
-        llm_instruction = next((item for item in llm_param_fields if item.get('name') == root_primitive_name and item.get('in') == 'body'), None)
-
-        if llm_instruction:
-            source = llm_instruction.get("source")
-            if source == "static_value":
-                val = llm_instruction.get('value')
-                if schema_type == 'integer':
-                    try: return int(val)
-                    except (ValueError, TypeError): return val
-                elif schema_type == 'boolean':
-                    return str(val).lower() == 'true'
-                elif schema_type == 'number':
-                    try: return float(val)
-                    except (ValueError, TypeError): return val
-                else: # string
-                    return val
-            elif source == "generate_dummy":
-                return DataMapper._generate_dummy_value(llm_instruction) # Pass LLM instruction for full details
-            elif source == "from_csv":
-                table_name = llm_instruction.get("table_name")
-                column_name = llm_instruction.get("column_name")
-                # PRIORITIZE table_name and column_name for from_csv, ignore 'value' from LLM if present
-                if table_name and column_name:
-                    return f"${{csv_{table_name}_{column_name}}}"
-                else:
-                    logger.warning(f"LLM suggested 'from_csv' for root primitive body but missing table_name/column_name. Falling back to dummy.")
-                    return DataMapper._generate_dummy_value(schema) # Fallback to dummy
-            elif source == "from_extraction":
-                extracted_var_name = llm_instruction.get("extracted_variable_name")
-                prefix = llm_instruction.get("prefix", "")
-                if extracted_var_name in extracted_vars:
-                    return f"{prefix}{extracted_vars[extracted_var_name]}"
-                else:
-                    logger.warning(f"LLM suggested 'from_extraction' for root primitive body but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
-                    return DataMapper._generate_dummy_value(schema) # Fallback to dummy
-            else:
-                # Fallback to DataMapper's default dummy generation if no LLM instruction
-                return DataMapper._generate_dummy_value(schema) # Pass the original schema for dummy generation
-    else:
-        logger.warning(f"Unsupported schema type at root: {schema_type}. Path: {'.'.join(current_path_segments)}")
-        return "<<UNSUPPORTED_BODY_TYPE>>"
-
-def _init_dummy_db():
-    """Initializes a dummy SQLite database if it doesn't exist."""
-    dummy_db_path = "database/petstore.db"
-    if not os.path.exists(dummy_db_path):
-        try:
-            os.makedirs(os.path.dirname(dummy_db_path), exist_ok=True)
-            conn = sqlite3.connect(dummy_db_path)
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS pets (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    tags TEXT
-                );
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    password TEXT NOT NULL,
-                    email TEXT,
-                    role_id INTEGER
-                );
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    order_id INTEGER PRIMARY KEY,
-                    user_id INTEGER,
-                    status TEXT
-                );
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS inventory_items (
-                    item_id INTEGER PRIMARY KEY,
-                    product_id INTEGER,
-                    quantity INTEGER
-                );
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS roles (
-                    id INTEGER PRIMARY KEY,
-                    role_name TEXT
-                );
-            """)
-            cursor.execute("INSERT INTO pets (id, name, status, tags) VALUES (1, 'Buddy', 'available', 'dog,friendly');")
-            cursor.execute("INSERT INTO pets (id, name, status, tags) VALUES (2, 'Whiskers', 'pending', 'cat');")
-            cursor.execute("INSERT INTO users (id, username, password, email, role_id) VALUES (101, 'testuser', 'testpass', 'test@example.com', 1);")
-            cursor.execute("INSERT INTO users (id, username, password, email, role_id) VALUES (102, 'user2', 'pass2', 'user2@example.com', 2);")
-            cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1001, 101, 'pending');")
-            cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1002, 102, 'completed');")
-            cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (1, 1, 50);")
-            cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (2, 2, 120);")
-            cursor.execute("INSERT INTO roles (id, role_name) VALUES (1, 'Admin');")
-            cursor.execute("INSERT INTO roles (id, role_name) VALUES (2, 'User');")
-            conn.commit()
-            conn.close()
-            logger.info(f"Dummy SQLite database created at {dummy_db_path} with sample data.")
-        except Exception as ex:
-            logger.error(f"Error creating dummy DB during init: {ex}")
-
 
 def main():
-    _init_dummy_db() # Call the dummy DB initialization here
-
     st.set_page_config(
         page_title="JMeter Agentic Framework",
         page_icon="⚡",
@@ -850,7 +547,10 @@ def main():
     if 'loop_count_input_specific' not in st.session_state:
         st.session_state.loop_count_input_specific = 1
 
-    # Default LLM prompt for initial display (removed f-prefix for backslash compatibility)
+    # Default LLM prompt for initial display
+    # UPDATED: Adjusted the prompt to reflect the new expected JSON output structure
+    # and added explicit instructions for headers, assertions, and CSV variables.
+    # Emphasize that the path should be the OpenAPI template path.
     default_llm_prompt = """
     You are an INTELLIGENT AUTOMATION ENGINEER with expert-level experience in building dynamic, data-driven JMeter test plans using OpenAPI (Swagger), database schemas, and sample data inputs.
 
@@ -864,7 +564,7 @@ def main():
         * **`path`**: For the `path` field, you MUST use the exact **OpenAPI template path** (e.g., `/pet/{petId}`, NOT `/pet/123` or any concrete value). This is crucial for correct mapping to Swagger definitions.
         * **`path_params`**: If the endpoint has path parameters (e.g., `{petId}` in the `path`), you MUST include them in this array with their `name` and `value`. If a value comes from CSV, use the JMeter variable format, e.g., `"${csv_users_appcd}"` or `"${csv_orders_order_id}"`. Otherwise, use a static value or a dummy value.
         * **`query_params`**: If parameters are in `query`, list them here with their `name` and `value`. If a value comes from CSV, use the JMeter variable format, e.g., `"${csv_users_username}"`. Otherwise, use a static value or a dummy value.
-        * **`body`**: If the request has a JSON body, you MUST provide it as a **JSON string**. For example, if the body is `{"key": "value"}` then output `"{\\"key\\": \\"value\\"}"`. Values within this string can be static, or JMeter variables (e.g., `"${clientId}"`) if sourced from CSV.
+        * **`body`**: If the request has a JSON body, you MUST provide it as a **JSON string**. For example, if the body is `{"key": "value"}` then output `"{\"key\": \"value\"}"`. Values within this string can be static, or JMeter variables (e.g., `"${clientId}"`) if sourced from CSV.
         * **`content_type`**: String like "application/json". Use `null` if no body.
         * **`extractions` (Per Sampler)**: If dynamic data extraction is needed (e.g., extracting a token after login or an ID from a creation response), include `extractions` *within the relevant `http_sampler` object*. The `json_path` should be accurate, and `var_name` should be a descriptive JMeter variable name (e.g., `auth_token`, `pet_id`).
     * **CRITICAL REQUIREMENTS FOR EACH `http_sampler`:**
@@ -904,7 +604,7 @@ def main():
     GET /api/v1/mapping/portals
 
     **Output Expectations:**
-    Your response MUST be ONLY a valid JSON object. **Ensure the JSON is always perfectly formed and complete, with all brackets and commas correctly placed and no trailing commas or incomplete structures. DO NOT include comments in the JSON output.**
+    Your response MUST be ONLY the JSON object described below, with no additional text, markdown, or conversational elements. **Ensure the JSON is always perfectly formed and complete, with all brackets and commas correctly placed and no trailing commas or incomplete structures. DO NOT include comments in the JSON output.**
 
     ```json
     {
@@ -922,14 +622,17 @@ def main():
             "name": "PUT /v1/update-client",
             "method": "PUT",
             "path": "/v1/update-client",
-            "body": "{\\\"clientId\\\": \\\"${clientId}\\\", \\\"newName\\\": \\\"${newName}\\\"}",
+            "body": {
+              "clientId": "${clientId}",
+              "newName": "${newName}"
+            },
             "content_type": "application/json",
             "headers": [
               {"name": "Authorization", "value": "Bearer ${auth_token}"},
               {"name": "Content-Type", "value": "application/json"}
             ],
-            "extractions": [
-              {"json_path": "$.clientId", "var_name": "update_client_clientId"}
+            "extractors": [
+              {"type": "json_path", "expression": "$.clientId", "variable": "update_client_clientId"}
             ],
             "assertions": [
               {"type": "response_code", "pattern": "200"},
@@ -943,17 +646,187 @@ def main():
     For each `path_params`, `query_params`, `body`, `headers`, `assertions`, and `extractions` item, **adhere to these strict rules**:
     -   **`path_params`**: Array of objects. Each object must have `name` (string) and `value` (string, can be a JMeter variable like `${variable_name}`).
     -   **`query_params`**: Array of objects. Each object must have `name` (string) and `value` (string, can be a JMeter variable like `${variable_name}`).
-    -   **`body`**: A JSON string (e.g., `"{\\"key\\": \\"value\\"}"`). Values can be JMeter variables. Use `null` if no body.
+    -   **`body`**: A JSON string (e.g., `"{\"key\": \"value\"}"`). Values can be JMeter variables. Use `null` if no body.
     -   **`content_type`**: String like "application/json". Use `null` if no body.
     -   **`headers`**: Array of objects. Each object must have `name` (string) and `value` (string, can be a JMeter variable).
     -   **`assertions`**: Array of objects. Each object must have `type` (string, "response_code" or "text_response") and `pattern` (string). This is now inside `http_sampler`.
     -   **`extractions`**: Array of objects. Each object must have `json_path` (string, JSONPath expression) and `var_name` (string, name of the JMeter variable to store the extracted value). This is now inside `http_sampler`.
-    - **Double Quotes for Property Names**: ALL property names (keys) MUST be enclosed in double quotes (e.g., `\"name\": \"value\"`, NOT `name: \"value\"`).
-    DO NOT include markdown code blocks. Respond only with pure JSON object.
-"""
+    """
 
     if 'llm_prompt_text' not in st.session_state:
         st.session_state.llm_prompt_text = default_llm_prompt
+
+    # Helper function to recursively build JSON body based on schema and LLM-suggested mappings
+    def _build_recursive_json_body_with_llm_guidance(
+        schema: Dict[str, Any], 
+        llm_param_fields: List[Dict[str, Any]], # LLM's suggested parameter/body field sourcing
+        current_path_segments: List[str], 
+        extracted_vars: Dict[str, str], # Already JMeter variable format
+        endpoint_key: str # For DataMapper calls if needed
+    ) -> Any:
+        """
+        Recursively builds a JSON body (or part of it) based on schema definitions,
+        prioritizing LLM-suggested sourcing strategies and integrating extracted variables
+        and DataMapper for CSV/dummy generation.
+        """
+        logger.debug(f"Entering _build_recursive_json_body_with_llm_guidance with: {'.'.join(current_path_segments)}, schema_type: {schema.get('type')}")
+
+        if not isinstance(schema, dict):
+            logger.debug(f"Schema is not a dictionary: {schema}. Returning as is.")
+            return schema 
+
+        schema_type = schema.get('type', 'object') 
+
+        if schema_type == 'object':
+            body_obj = {}
+            properties = schema.get('properties', {})
+            
+            for prop_name, prop_details in properties.items():
+                full_param_name_dot_path = ".".join(current_path_segments + [prop_name])
+                
+                # Find LLM's explicit instruction for this specific field
+                # For body fields, the 'name' in LLM instruction should match the full_param_name_dot_path
+                llm_instruction = next((item for item in llm_param_fields if item.get('name') == full_param_name_dot_path and item.get('in') == 'body'), None)
+
+                value_set = False
+
+                if llm_instruction:
+                    source = llm_instruction.get("source")
+                    if source == "from_csv":
+                        table_name = llm_instruction.get("table_name")
+                        column_name = llm_instruction.get("column_name")
+                        # PRIORITIZE table_name and column_name for from_csv, ignore 'value' from LLM if present
+                        if table_name and column_name:
+                            jmeter_var = f"${{csv_{table_name}_{column_name}}}"
+                            body_obj[prop_name] = jmeter_var
+                            value_set = True
+                            logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM CSV instruction: {jmeter_var}")
+                        else:
+                            # Fallback if table_name or column_name is missing for from_csv
+                            logger.warning(f"LLM suggested 'from_csv' for {full_param_name_dot_path} but missing table_name/column_name. Falling back to dummy.")
+                            body_obj[prop_name] = DataMapper._generate_dummy_value(llm_instruction)
+                            value_set = True
+                    elif source == "from_extraction":
+                        extracted_var_name = llm_instruction.get("extracted_variable_name")
+                        prefix = llm_instruction.get("prefix", "")
+                        if extracted_var_name in extracted_vars: # Check if the extracted variable is available
+                             resolved_value = f"{prefix}{extracted_vars[extracted_var_name]}"
+                             body_obj[prop_name] = resolved_value
+                             value_set = True
+                             logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM extraction instruction: {resolved_value}")
+                        else:
+                             logger.warning(f"LLM suggested 'from_extraction' for {prop_name} but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
+                             body_obj[prop_name] = DataMapper._generate_dummy_value(llm_instruction) # Use llm_instruction as it contains schema details
+                             value_set = True
+                    elif source == "static_value":
+                        body_obj[prop_name] = llm_instruction.get("value")
+                        value_set = True
+                        logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM static instruction: {llm_instruction.get('value')}")
+                    elif source == "generate_dummy":
+                        body_obj[prop_name] = DataMapper._generate_dummy_value(llm_instruction) # Pass LLM instruction which has swagger details
+                        value_set = True
+                        logger.debug(f"Body field '{full_param_name_dot_path}' populated from LLM dummy instruction: {body_obj[prop_name]}")
+                
+                # If LLM didn't provide specific instruction or it failed, fall back
+                if not value_set:
+                    # Recursively build for nested objects/arrays
+                    if prop_details.get('type') == 'object':
+                        body_obj[prop_name] = _build_recursive_json_body_with_llm_guidance(
+                            prop_details, llm_param_fields, current_path_segments + [prop_name], extracted_vars, endpoint_key
+                        )
+                        logger.debug(f"Body field '{full_param_name_dot_path}' populated by recursive call (object).")
+                    elif prop_details.get('type') == 'array':
+                        if 'items' in prop_details:
+                            array_item_path_segments = current_path_segments + [prop_name, "_item"]
+                            
+                            item_schema = prop_details['items'] # Get the schema for array items
+                            
+                            generated_item = _build_recursive_json_body_with_llm_guidance(
+                                item_schema, llm_param_fields, array_item_path_segments, extracted_vars, endpoint_key
+                            )
+                            body_obj[prop_name] = [generated_item] # Generate one item for the array as a sample
+                            logger.debug(f"Body field '{full_param_name_dot_path}' (array) populated with one recursive item: {body_obj[prop_name]}")
+                        else:
+                            body_obj[prop_name] = [] # Empty array if no items schema
+                            logger.debug(f"Body field '{full_param_name_dot_path}' (array) populated as empty (no item schema).")
+                    else: # Primitive type (string, integer, boolean, number etc.)
+                        # Fallback to DataMapper's default dummy generation if no LLM instruction or other source
+                        body_obj[prop_name] = DataMapper._generate_dummy_value(prop_details) # Pass prop_details for smarter dummy generation
+                        logger.debug(f"Body field '{full_param_name_dot_path}' (primitive, fallback) populated with dummy: {body_obj[prop_name]}")
+
+            return body_obj
+        
+        elif schema_type == 'array':
+            logger.debug(f"Schema is an array. Path: {'.'.join(current_path_segments)}")
+            # Find LLM's explicit instruction for the root array itself (if body is an array)
+            root_array_full_path = ".".join(current_path_segments)
+            llm_instruction = next((item for item in llm_param_fields if item.get('name') == root_array_full_path and item.get('in') == 'body'), None)
+
+            if llm_instruction and llm_instruction.get("source") == "static_value":
+                try:
+                    return json.loads(llm_instruction.get("value")) # Assume static value for array is a JSON string of array
+                except json.JSONDecodeError:
+                    logger.warning(f"Static value for array body at {root_array_full_path} is not valid JSON array: {llm_instruction.get('value')}")
+                    return []
+            
+            if 'items' in schema:
+                # Generate a single item for the array as a sample based on its item schema
+                generated_item = _build_recursive_json_body_with_llm_guidance(
+                    schema['items'], llm_param_fields, current_path_segments + ["_item"], extracted_vars, endpoint_key
+                )
+                logger.debug(f"Root array body populated with one recursive item: {generated_item}")
+                return [generated_item]
+            else:
+                logger.debug("Root array body populated as empty (no item schema).")
+                return [] 
+
+        # Handle primitive types directly at the current level (e.g., if body is just a string or integer)
+        elif schema_type in ['string', 'integer', 'boolean', 'number']:
+            # Corrected f-string: removed extra single quote
+            logger.debug(f"Schema is a primitive type: {schema_type}. Path: {'.'.join(current_path_segments)}")
+            # For root-level primitive body, LLM instruction's name should match current_path_segments (empty string for root)
+            root_primitive_name = ".".join(current_path_segments) if current_path_segments else "" # For root body, name ""
+            llm_instruction = next((item for item in llm_param_fields if item.get('name') == root_primitive_name and item.get('in') == 'body'), None)
+
+            if llm_instruction:
+                source = llm_instruction.get("source")
+                if source == "static_value":
+                    val = llm_instruction.get('value')
+                    if schema_type == 'integer':
+                        try: return int(val)
+                        except (ValueError, TypeError): return val
+                    elif schema_type == 'boolean':
+                        return str(val).lower() == 'true'
+                    elif schema_type == 'number':
+                        try: return float(val)
+                        except (ValueError, TypeError): return val
+                    else: # string
+                        return val
+                elif source == "generate_dummy":
+                    return DataMapper._generate_dummy_value(llm_instruction) # Pass LLM instruction for full details
+                elif source == "from_csv":
+                    table_name = llm_instruction.get("table_name")
+                    column_name = llm_instruction.get("column_name")
+                    # PRIORITIZE table_name and column_name for from_csv, ignore 'value' from LLM if present
+                    if table_name and column_name:
+                        return f"${{csv_{table_name}_{column_name}}}"
+                    else:
+                        logger.warning(f"LLM suggested 'from_csv' for root primitive body but missing table_name/column_name. Falling back to dummy.")
+                        return DataMapper._generate_dummy_value(schema) # Fallback to dummy
+                elif source == "from_extraction":
+                    extracted_var_name = llm_instruction.get("extracted_variable_name")
+                    prefix = llm_instruction.get("prefix", "")
+                    if extracted_var_name in extracted_vars:
+                        return f"{prefix}{extracted_vars[extracted_var_name]}"
+                    else:
+                        logger.warning(f"LLM suggested 'from_extraction' for root primitive body but '{extracted_var_name}' not found in extracted_variables_map. Falling back to dummy.")
+                        return DataMapper._generate_dummy_value(schema) # Fallback to dummy
+            else:
+                # Fallback to DataMapper's default dummy generation if no LLM instruction
+                return DataMapper._generate_dummy_value(schema) # Pass the original schema for dummy generation
+        else:
+            logger.warning(f"Unsupported schema type at root: {schema_type}. Path: {'.'.join(current_path_segments)}")
+            return "<<UNSUPPORTED_BODY_TYPE>>"
 
 
     # Create three columns for the main inputs
@@ -1204,9 +1077,63 @@ def main():
 
                             if st.session_state.db_type_selected == "SQLite" and not os.path.exists(db_file_path):
                                 if st.button("Create Dummy SQLite DB", key="create_dummy_db_on_connect"):
-                                    _init_dummy_db() # Call the encapsulated function here
-                                    st.success(f"Dummy SQLite database created at {db_file_path} with sample data.")
-                                    st.rerun()
+                                    try:
+                                        os.makedirs(os.path.dirname(db_file_path), exist_ok=True)
+                                        conn = sqlite3.connect(db_file_path)
+                                        cursor = conn.cursor()
+                                        cursor.execute("""
+                                            CREATE TABLE IF NOT EXISTS pets (
+                                                id INTEGER PRIMARY KEY,
+                                                name TEXT NOT NULL,
+                                                status TEXT NOT NULL,
+                                                tags TEXT
+                                            );
+                                        """)
+                                        cursor.execute("""
+                                            CREATE TABLE IF NOT EXISTS users (
+                                                id INTEGER PRIMARY KEY,
+                                                username TEXT NOT NULL,
+                                                password TEXT NOT NULL,
+                                                email TEXT,
+                                                role_id INTEGER
+                                            );
+                                        """)
+                                        cursor.execute("""
+                                            CREATE TABLE IF NOT EXISTS orders (
+                                                order_id INTEGER PRIMARY KEY,
+                                                user_id INTEGER,
+                                                status TEXT
+                                            );
+                                        """)
+                                        cursor.execute("""
+                                            CREATE TABLE IF NOT EXISTS inventory_items (
+                                                item_id INTEGER PRIMARY KEY,
+                                                product_id INTEGER,
+                                                quantity INTEGER
+                                            );
+                                        """)
+                                        cursor.execute("""
+                                            CREATE TABLE IF NOT EXISTS roles (
+                                                id INTEGER PRIMARY KEY,
+                                                role_name TEXT
+                                            );
+                                        """)
+                                        cursor.execute("INSERT INTO pets (id, name, status, tags) VALUES (1, 'Buddy', 'available', 'dog,friendly');")
+                                        cursor.execute("INSERT INTO pets (id, name, status, tags) VALUES (2, 'Whiskers', 'pending', 'cat');")
+                                        cursor.execute("INSERT INTO users (id, username, password, email, role_id) VALUES (101, 'testuser', 'testpass', 'test@example.com', 1);")
+                                        cursor.execute("INSERT INTO users (id, username, password, email, role_id) VALUES (102, 'user2', 'pass2', 'user2@example.com', 2);")
+                                        cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1001, 101, 'pending');")
+                                        cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1002, 102, 'completed');")
+                                        cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (1, 1, 50);")
+                                        cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (2, 2, 120);")
+                                        cursor.execute("INSERT INTO roles (id, role_name) VALUES (1, 'Admin');")
+                                        cursor.execute("INSERT INTO roles (id, role_name) VALUES (2, 'User');")
+                                        conn.commit()
+                                        conn.close()
+                                        st.success(f"Dummy SQLite database created at {db_file_path} with sample data.")
+                                        st.rerun()
+                                    except Exception as ex:
+                                        st.error(f"Error creating dummy DB: {ex}")
                                         
                         else:
                             st.error("Failed to connect to database. Check connection parameters and logs.")
@@ -1316,25 +1243,31 @@ def main():
                             llm_csv_config = test_plan_data.get('csv_data_set_config') 
                             if isinstance(llm_csv_config, list) and llm_csv_config:
                                 llm_csv_config = llm_csv_config[0] # Take the first item if it's a list
-                            
-                            # Collect all CSV data set configs from LLM response (handling multiple, if LLM outputs them)
-                            all_llm_csv_configs = []
-                            if isinstance(llm_csv_config, dict) and llm_csv_config.get('variable_names') and llm_csv_config.get('filename'):
-                                all_llm_csv_configs.append(llm_csv_config)
-                            
-                            for key, value in test_plan_data.items():
-                                if key.startswith('csv_data_set_config_') and isinstance(value, dict) and 'variable_names' in value and 'filename' in value:
-                                    if value not in all_llm_csv_configs: # Avoid duplicates if 'csv_data_set_config' was also dynamically named
-                                         all_llm_csv_configs.append(value)
 
-                            if all_llm_csv_configs:
+                            if isinstance(llm_csv_config, dict) and llm_csv_config.get('variable_names'):
                                 st.markdown("---")
-                                st.markdown(f"**CSV Data Set Configs:**")
-                                for csv_conf_item in all_llm_csv_configs:
-                                    st.write(f"- **Filename:** `{csv_conf_item['filename']}`, **Variable Names:** `{', '.join(csv_conf_item['variable_names'])}`")
+                                st.markdown(f"**CSV Data Set Config:**")
+                                st.write(f"Filename: `{llm_csv_config['filename']}`")
+                                st.write(
+                                    f"Variable Names: `{', '.join(llm_csv_config['variable_names'])}`")
                             else:
-                                st.info("No CSV Data Set Config found in AI-generated design.")
-
+                                # New logic to handle multiple dynamic csv_data_set_config_XXX from LLM for display
+                                found_dynamic_csv_configs_display = False
+                                # Using a dictionary to ensure unique filenames for display
+                                display_csv_configs = {} 
+                                for key, value in test_plan_data.items():
+                                    if key.startswith('csv_data_set_config_') and isinstance(value, dict) and 'variable_names' in value and 'filename' in value:
+                                        found_dynamic_csv_configs_display = True
+                                        display_csv_configs[value['filename']] = value['variable_names']
+                                
+                                if found_dynamic_csv_configs_display:
+                                    st.markdown("---")
+                                    st.markdown(f"**CSV Data Set Configs (Multiple Files):**")
+                                    for filename, variable_names in display_csv_configs.items():
+                                        st.write(f"- **{filename}:** `{', '.join(variable_names)}`")
+                                else:
+                                    st.info("No CSV Data Set Config found in AI-generated design.")
+                            
                             st.markdown("---")
                             st.markdown(f"**HTTP Samplers:**")
                             if 'http_samplers' in test_plan_data and isinstance(test_plan_data['http_samplers'], list):
@@ -1374,26 +1307,15 @@ def main():
 
                                     if 'extractions' in sampler and sampler['extractions']:
                                         st.markdown(f"**Extractions for this Sampler:**")
-                                        # Corrected to check if 'extraction' is a dictionary
                                         for extraction in sampler['extractions']:
-                                            if isinstance(extraction, dict):
-                                                json_path = extraction.get('json_path')
-                                                var_name = extraction.get('var_name')
-                                                if json_path and var_name: # Only display if both are present
-                                                    st.write(
-                                                        f"- JSONPath: `{json_path}` -> Var: `{var_name}`")
-                                                else:
-                                                    logger.warning(f"Malformed extraction entry found and skipped: {extraction}")
-                                            else:
-                                                logger.warning(f"Non-dictionary extraction entry found and skipped: {extraction}")
+                                            st.write(
+                                                f"- JSONPath: `{extraction['json_path']}` -> Var: `{extraction['var_name']}`")
                             else:
                                 st.info("No HTTP Samplers found in AI-generated design.")
                             
                             time.sleep(0.1) # Simulate streaming delay
                             
                     else:
-                        # This else block is now reached ONLY if structured_scenario is None
-                        # after initial LLM call and repair attempts, implying a true failure.
                         st.session_state.llm_structured_scenario = None
                         st.error("Failed to generate structured AI design.")
 
@@ -1585,11 +1507,10 @@ def main():
                     current_sampler_config = json.loads(json.dumps(http_sampler)) 
 
                     # Populate extracted_variables_map from the current AI sampler's extractions
-                    # Corrected to check if 'extractions' exists and is a list
-                    if 'extractions' in current_sampler_config and isinstance(current_sampler_config['extractions'], list):
-                        for extractor_data in current_sampler_config['extractions']:
-                            if isinstance(extractor_data, dict) and 'var_name' in extractor_data:
-                                extracted_variables_map[extractor_data['var_name'].lower()] = f"${{{extractor_data['var_name']}}}"
+                    # Ensure 'extractions' is used as it's the new key from the LLM prompt.
+                    for extractor_data in current_sampler_config.get('extractions', []): # Corrected key
+                        if 'var_name' in extractor_data:
+                            extracted_variables_map[extractor_data['var_name'].lower()] = f"${{{extractor_data['var_name']}}}"
                     
                     new_scenario_configs.append(current_sampler_config)
             else:
@@ -1707,13 +1628,10 @@ def main():
                                         request_config['headers'][header_name] = f"dummy_{header_name}"
 
                         if st.session_state.enable_auth_flow and ep_key != f"{st.session_state.auth_login_method} {st.session_state.auth_login_endpoint_path}":
-                            auth_header_name_lower = st.session_state.auth_header_name.lower()
-                            # Check if Authorization header is already present (case-insensitive)
-                            if not any(h_name.lower() == auth_header_name_lower for h_name in request_config['headers'].keys()):
-                                if "authtoken" in extracted_variables_map:
-                                    request_config["headers"][st.session_state.auth_header_name] = f"{st.session_state.auth_header_prefix}{extracted_variables_map['authtoken']}"
-                                else:
-                                    st.warning(f"Authentication flow enabled but auth token not found for {ep_key}. Check login configuration.")
+                            if "authtoken" in extracted_variables_map:
+                                request_config["headers"][st.session_state.auth_header_name] = f"{st.session_state.auth_header_prefix}{extracted_variables_map['authtoken']}"
+                            else:
+                                st.warning(f"Authentication flow enabled but auth token not found for {ep_key}. Check login configuration.")
 
                         if 'parameters' in resolved_endpoint_data:
                             for param in resolved_endpoint_data['parameters']:
@@ -1732,9 +1650,7 @@ def main():
                             if resolved_endpoint_data.get('consumes'):
                                 content_type_header = resolved_endpoint_data['consumes'][0]
                             elif 'requestBody' in resolved_endpoint_data and 'content' in resolved_endpoint_data['requestBody']:
-                                # For OpenAPI 3.0+
-                                content_types = resolved_endpoint_data['requestBody'].get('content', {})
-                                first_content_type = next(iter(content_types.keys()), None) # Get content type from requestBody
+                                first_content_type = next(iter(content_types.values()), None) # Get content type from requestBody
                                 if first_content_type:
                                     content_type_header = first_content_type
                             request_config["headers"]["Content-Type"] = content_type_header
@@ -1747,11 +1663,11 @@ def main():
                                         request_body_schema = content_types['application/json'].get('schema')
                                     else:
                                         request_body_schema = next(iter(content_types.values())).get('schema')
-                            else:
-                                for param in resolved_endpoint_data.get('parameters', []):
-                                    if param.get('in') == 'body' and 'schema' in param:
-                                        request_body_schema = param['schema']
-                                        break
+                        else:
+                            for param in resolved_endpoint_data.get('parameters', []):
+                                if param.get('in') == 'body' and 'schema' in param:
+                                    request_body_schema = param['schema']
+                                    break
                             
                             dummy_llm_param_fields = []
                             if ep_key in st.session_state.mappings:
@@ -1827,7 +1743,7 @@ def main():
                                         resp_schema = content_types_resp['application/json'].get('schema')
                                     else:
                                         # Try to get schema from any content type if JSON not found
-                                        resp_schema = next(iter(content_types_resp.values())).get('schema')
+                                        resp_schema = next(iter(content_types_resp.values()), {}).get('schema')
                                 
                                 if resp_schema and 'properties' in resp_schema:
                                     for prop_name, prop_details in resp_schema['properties'].items():
@@ -1883,6 +1799,7 @@ def main():
             if base_path_from_swagger != '/' and base_path_from_swagger.endswith('/'):
                 base_path_from_swagger = base_path_from_swagger.rstrip('/')
 
+            # UPDATED: The loop now processes a single test_plan object from the LLM response.
             # structured_scenario is now a list containing one item (the test_plan object)
             if st.session_state.llm_structured_scenario and 'test_plan' in st.session_state.llm_structured_scenario: # Access directly
                 llm_response_test_plan = st.session_state.llm_structured_scenario['test_plan'] # Access directly
@@ -1998,22 +1915,12 @@ def main():
                                 request_config['assertions'].append(assertion_data) # Add as is if new type
 
                         # Handle extractions from LLM response (now specific to this sampler)
-                        # Corrected to handle potential missing 'json_path' key safely
                         for extractor_data in http_sampler.get('extractions', []):
-                            if isinstance(extractor_data, dict):
-                                json_path_expr = extractor_data.get('json_path')
-                                var_name = extractor_data.get('var_name')
-                                if json_path_expr and var_name:
-                                    request_config['json_extractors'].append({
-                                        "json_path_expr": json_path_expr,
-                                        "var_name": var_name
-                                    })
-                                    extracted_variables_map[var_name.lower()] = f"${{{var_name}}}"
-                                else:
-                                    logger.warning(f"Malformed extraction entry from LLM and skipped: {extractor_data}")
-                            else:
-                                logger.warning(f"Non-dictionary extraction entry from LLM found and skipped: {extractor_data}")
-
+                            request_config['json_extractors'].append({
+                                "json_path_expr": extractor_data['json_path'],
+                                "var_name": extractor_data['var_name']
+                            })
+                            extracted_variables_map[extractor_data['var_name'].lower()] = f"${{{extractor_data['var_name']}}}"
 
                         llm_designed_configs.append(request_config)
             
@@ -2038,63 +1945,204 @@ def main():
     if st.button("Generate JMeter Script", key="generate_button_final", type="primary"):
         if not st.session_state.swagger_endpoints:
             st.error("Please fetch Swagger specification or upload parsed endpoints and ensure endpoints are parsed.")
-            # Clear download states if preconditions are not met
-            st.session_state.jmx_content_download = None
-            st.session_state.csv_content_download = None
-            st.session_state.mapping_metadata_download = None
             return
-        if not st.session_state.llm_structured_scenario: # Changed from scenario_requests_configs to llm_structured_scenario
-            st.error("Please generate an AI script design before generating JMeter script.")
-            # Clear download states if preconditions are not met
-            st.session_state.jmx_content_download = None
-            st.session_state.csv_content_download = None
-            st.session_state.mapping_metadata_download = None
+        if not st.session_state.scenario_requests_configs:
+            st.error("Please generate an AI script design or refine the scenario manually before generating JMeter script.")
             return
         if not st.session_state.db_tables_schema or not st.session_state.db_sampled_data:
-            # Only block if scenario actually *requires* DB data (e.g., if LLM output used DB values)
-            # For now, a warning is sufficient. If scenario_requests_configs has CSV vars, it might fail later.
-            st.warning("Database schema or sampled data not loaded. JMeter script might not be fully data-driven if your scenario relies on DB data.")
+            st.error("Please connect to database or upload schema/sampled data if your scenario relies on DB data.")
 
         st.info("Generating JMeter script... Please wait.")
 
         try:
-            # Call the generate_jmx_from_llm method from JMeterScriptGenerator
-            jmx_content, csv_contents, mapping_metadata = JMeterScriptGenerator.generate_jmx_from_llm(
-                llm_structured_scenario=st.session_state.llm_structured_scenario,
-                swagger_endpoints=st.session_state.swagger_endpoints,
-                db_tables_schema=st.session_state.db_tables_schema,
-                db_sampled_data=st.session_state.db_sampled_data,
+            # The scenario_plan for JMeterGenerator needs to be a list of individual requests.
+            # st.session_state.scenario_requests_configs already holds this list,
+            # whether it came from LLM processing or manual refinement.
+            scenario_plan = {"requests": st.session_state.scenario_requests_configs}
+            
+            num_users = st.session_state.num_users_input
+            ramp_up_time = st.session_state.ramp_up_time_input
+            loop_count = st.session_state.loop_count_input_specific if st.session_state.loop_count_option == "Specify iterations" else -1
+            
+            global_constant_timer_delay = st.session_state.constant_timer_delay_ms if st.session_state.enable_constant_timer else 0
+
+            # List to hold CSV configurations for the generator
+            csv_configs_for_generator = []
+            
+            # Dictionary to store content for each CSV file to be downloaded
+            downloadable_csv_contents = {}
+
+            if st.session_state.llm_structured_scenario and 'test_plan' in st.session_state.llm_structured_scenario:
+                llm_response_test_plan = st.session_state.llm_structured_scenario['test_plan']
+                
+                # Collect all CSV data set configs from LLM response
+                all_llm_csv_configs = []
+                
+                # First, try to get the single 'csv_data_set_config' as per prompt instruction
+                llm_csv_config_main = llm_response_test_plan.get('csv_data_set_config') 
+                if isinstance(llm_csv_config_main, list) and llm_csv_config_main:
+                    llm_csv_config_main = llm_csv_config_main[0] # Take the first item if it's a list
+                if isinstance(llm_csv_config_main, dict) and llm_csv_config_main.get('variable_names') and llm_csv_config_main.get('filename'):
+                    all_llm_csv_configs.append(llm_csv_config_main)
+
+                # Now, also check for dynamically named csv_data_set_config_XXX keys
+                for key, value in llm_response_test_plan.items():
+                    if key.startswith('csv_data_set_config_') and isinstance(value, dict) and 'variable_names' in value and 'filename' in value:
+                        # Ensure we don't duplicate if the main csv_data_set_config was also dynamically named
+                        if value not in all_llm_csv_configs:
+                             all_llm_csv_configs.append(value)
+                
+                # Process each identified CSV configuration
+                for csv_conf_item in all_llm_csv_configs:
+                    filename_to_use = csv_conf_item['filename']
+                    variable_names_from_llm = csv_conf_item['variable_names']
+
+                    current_csv_data = {}
+                    current_csv_headers_internal = set() # To store internal JMeter variable names (e.g., csv_table_column)
+                    
+                    for var_name_from_llm in variable_names_from_llm:
+                        found_match = False
+                        # Try to find a match in sampled data using flexible matching (e.g., "users_username" -> users table "username" column)
+                        for table_name, df in st.session_state.db_sampled_data.items():
+                            for col_name in df.columns:
+                                # Prioritize exact match or case-insensitive match (LLM var name vs table_col, or just LLM var name vs col)
+                                if var_name_from_llm.lower() == f"{table_name.lower()}_{col_name.lower()}" or \
+                                   var_name_from_llm.lower() == col_name.lower(): 
+                                    jmeter_var_name_internal = f"csv_{table_name}_{col_name}" # Consistent internal naming for CSV content
+                                    if jmeter_var_name_internal not in current_csv_data:
+                                        current_csv_data[jmeter_var_name_internal] = df[col_name].tolist()
+                                        current_csv_headers_internal.add(jmeter_var_name_internal)
+                                    found_match = True
+                                    break 
+                            if found_match:
+                                break
+                        
+                        if not found_match:
+                            logger.warning(f"LLM suggested CSV variable '{var_name_from_llm}' in '{filename_to_use}' but no database match found. This variable might not be correctly populated in CSV.")
+
+                    if current_csv_headers_internal and current_csv_data:
+                        csv_headers_list_internal = sorted(list(current_csv_headers_internal))
+                        generated_csv_string = ",".join(csv_headers_list_internal) + "\n"
+                        
+                        max_rows = 0
+                        if current_csv_data:
+                            max_rows = max(len(v) for v in current_csv_data.values())
+
+                        for i in range(max_rows):
+                            row_values = []
+                            for header_key in csv_headers_list_internal:
+                                values = current_csv_data.get(header_key, [])
+                                # Ensure the index 'i' is within the bounds of the 'values' list
+                                row_values.append(str(values[i]) if i < len(values) else "")
+                            generated_csv_string += ",".join(row_values) + "\n"
+                        
+                        # Add to list for JMeter generator and for downloadable content
+                        csv_configs_for_generator.append({
+                            'filename': filename_to_use,
+                            'variable_names': variable_names_from_llm, # Use LLM's requested names for JMeter CSV element
+                        })
+                        downloadable_csv_contents[filename_to_use] = generated_csv_string
+
+            else: # Fallback to existing logic if LLM didn't provide new structure
+                # This block will now generate a single 'data.csv' if no LLM scenario or if LLM didn't provide CSV configs
+                # This is important for "Refine Scenario Manually" when no AI design exists yet.
+                csv_data_for_jmeter_fallback = {}
+                csv_headers_fallback = set()
+                for endpoint_key, params_map in st.session_state.mappings.items():
+                    for param_name, mapping_info in params_map.items():
+                        if mapping_info['source'] == "DB Sample (CSV)":
+                            if 'table_name' in mapping_info and 'column_name' in mapping_info:
+                                jmeter_var_name_raw = f"csv_{mapping_info['table_name']}_{mapping_info['column_name']}"
+                            else:
+                                logger.warning(f"Mapping info for {param_name} (from DB Sample) missing table_name/column_name. Cannot generate CSV.")
+                                continue
+
+                            if mapping_info['table_name'] in st.session_state.db_sampled_data and \
+                               mapping_info['column_name'] in st.session_state.db_sampled_data[mapping_info['table_name']].columns:
+                                
+                                if jmeter_var_name_raw not in csv_data_for_jmeter_fallback:
+                                    csv_data_for_jmeter_fallback[jmeter_var_name_raw] = st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']].tolist()
+                                    csv_headers_fallback.add(jmeter_var_name_raw)
+                                else:
+                                    # Ensure we get the maximum number of rows if different columns have different lengths
+                                    if len(csv_data_for_jmeter_fallback[jmeter_var_name_raw]) < len(st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']]):
+                                        csv_data_for_jmeter_fallback[jmeter_var_name_raw] = st.session_state.db_sampled_data[mapping_info['table_name']][mapping_info['column_name']].tolist()
+
+                if csv_headers_fallback and csv_data_for_jmeter_fallback:
+                    csv_headers_list_fallback = sorted(list(csv_headers_fallback))
+                    generated_csv_string_fallback = ",".join(csv_headers_list_fallback) + "\n"
+                    
+                    max_rows_fallback = 0
+                    if csv_data_for_jmeter_fallback:
+                        max_rows_fallback = max(len(v) for v in csv_data_for_jmeter_fallback.values())
+
+                    for i in range(max_rows_fallback):
+                        row_values_fallback = []
+                        for header_key in csv_headers_list_fallback:
+                            values = csv_data_for_jmeter_fallback.get(header_key, [])
+                            row_values_fallback.append(str(values[i]) if i < len(values) else "")
+                        generated_csv_string_fallback += ",".join(row_values_fallback) + "\n"
+                    
+                    csv_configs_for_generator.append({
+                        'filename': "data.csv",
+                        'variable_names': csv_headers_list_fallback, # Using the column names as variable names
+                    })
+                    downloadable_csv_contents["data.csv"] = generated_csv_string_fallback
+
+
+            generator = JMeterScriptGenerator(
                 test_plan_name=st.session_state.test_plan_name,
+                thread_group_name=st.session_state.thread_group_name
+            )
+            
+            # Use the swagger_parser to get the base URL
+            current_full_swagger_spec_dict = {}
+            if st.session_state.swagger_parser and st.session_state.swagger_parser.swagger_data:
+                parsed_url_from_swagger_data = urlparse(st.session_state.swagger_parser.swagger_data.get('host', st.session_state.current_swagger_url))
+                protocol = st.session_state.swagger_parser.swagger_data.get('schemes', ['https'])[0]
+                domain = parsed_url_from_swagger_data.hostname
+                port = parsed_url_from_swagger_data.port if parsed_url_from_swagger_data.port else ""
+                base_path_for_http_defaults = st.session_state.swagger_parser.swagger_data.get('basePath', '/')
+                if not base_path_for_http_defaults.startswith('/'):
+                    base_path_for_http_defaults = '/' + base_path_for_http_defaults
+                if base_path_for_http_defaults != '/' and base_path_for_http_defaults.endswith('/'):
+                    base_path_for_http_defaults = base_path_for_http_defaults.rstrip('/')
+                current_full_swagger_spec_dict = st.session_state.swagger_parser.swagger_data # Use swagger_data directly
+            else: # Fallback if swagger_parser is not set or data missing
+                parsed_url = urlparse(swagger_url) # Use the input URL as fallback
+                protocol = parsed_url.scheme
+                domain = parsed_url.hostname
+                port = parsed_url.port if parsed_url.port else ""
+                base_path_for_http_defaults = "/"
+
+
+            jmx_content, _ = generator.generate_jmx(
+                app_base_url=swagger_url, # This is just a string, not used for parsing anymore
+                thread_group_users=num_users,
+                ramp_up_time=ramp_up_time,
+                loop_count=loop_count,
+                scenario_plan=scenario_plan, 
+                csv_configs=csv_configs_for_generator, # Pass the list of CSV configs
+                global_constant_timer_delay=global_constant_timer_delay,
+                test_plan_name=st.session_state.test_plan_name, 
                 thread_group_name=st.session_state.thread_group_name,
-                num_users=st.session_state.num_users_input,
-                ramp_up_time=st.session_state.ramp_up_time_input,
-                loop_count=st.session_state.loop_count_input_specific if st.session_state.loop_count_option == "Specify iterations" else -1,
-                global_constant_timer_delay=st.session_state.constant_timer_delay_ms,
-                enable_auth_flow=st.session_state.enable_auth_flow,
-                auth_login_endpoint_path=st.session_state.auth_login_endpoint_path,
-                auth_login_method=st.session_state.auth_login_method,
-                auth_login_body_template=st.session_state.auth_login_body_template,
-                auth_token_json_path=st.session_state.auth_token_json_path,
-                auth_header_name=st.session_state.auth_header_name,
-                auth_header_prefix=st.session_state.auth_header_prefix,
-                full_swagger_spec=st.session_state.swagger_parser.swagger_data if st.session_state.swagger_parser else {},
-                enable_setup_teardown_thread_groups=st.session_state.enable_setup_teardown_thread_groups,
-                current_swagger_url=st.session_state.current_swagger_url
+                http_defaults_protocol=protocol,
+                http_defaults_domain=domain,
+                http_defaults_port=port,
+                http_defaults_base_path=base_path_for_http_defaults,
+                full_swagger_spec=current_full_swagger_spec_dict,
+                enable_setup_teardown_thread_groups=st.session_state.enable_setup_teardown_thread_groups
             )
 
             st.session_state.jmx_content_download = jmx_content
-            st.session_state.csv_content_download = csv_contents
-            st.session_state.mapping_metadata_download = mapping_metadata
+            st.session_state.csv_content_download = downloadable_csv_contents # Store the dictionary of CSV contents
+            st.session_state.mapping_metadata_download = json.dumps(st.session_state.mappings, indent=2)
 
-            if jmx_content:
-                st.success("JMeter script generated successfully!")
-            else:
-                st.error("Failed to generate JMeter script.")
+            st.success("JMeter script generated successfully!")
 
         except Exception as e:
             st.error(f"An error occurred during script generation: {e}")
             logger.error(f"Error in main app execution: {e}", exc_info=True)
-
 
     st.subheader("Download Generated Files")
     if st.session_state.full_swagger_spec_download:
@@ -2145,4 +2193,64 @@ def main():
     st.markdown("Developed with ❤️ by Your AI Assistant")
 
 if __name__ == "__main__":
+    dummy_db_path = "database/petstore.db"
+    if not os.path.exists(dummy_db_path):
+        try:
+            os.makedirs(os.path.dirname(dummy_db_path), exist_ok=True)
+            conn = sqlite3.connect(dummy_db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pets (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    tags TEXT
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    email TEXT,
+                    role_id INTEGER
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_id INTEGER PRIMARY KEY,
+                    user_id INTEGER,
+                    status TEXT
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS inventory_items (
+                    item_id INTEGER PRIMARY KEY,
+                    product_id INTEGER,
+                    quantity INTEGER
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS roles (
+                    id INTEGER PRIMARY KEY,
+                    role_name TEXT
+                );
+            """)
+            cursor.execute("INSERT INTO pets (id, name, status, tags) VALUES (1, 'Buddy', 'available', 'dog,friendly');")
+            cursor.execute("INSERT INTO pets (id, name, status, tags) VALUES (2, 'Whiskers', 'pending', 'cat');")
+            cursor.execute("INSERT INTO users (id, username, password, email, role_id) VALUES (101, 'testuser', 'testpass', 'test@example.com', 1);")
+            cursor.execute("INSERT INTO users (id, username, password, email, role_id) VALUES (102, 'user2', 'pass2', 'user2@example.com', 2);")
+            cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1001, 101, 'pending');")
+            cursor.execute("INSERT INTO orders (order_id, user_id, status) VALUES (1002, 102, 'completed');")
+            cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (1, 1, 50);")
+            cursor.execute("INSERT INTO inventory_items (item_id, product_id, quantity) VALUES (2, 2, 120);")
+            cursor.execute("INSERT INTO roles (id, role_name) VALUES (1, 'Admin');")
+            cursor.execute("INSERT INTO roles (id, role_name) VALUES (2, 'User');")
+            conn.commit()
+            conn.close()
+            logger.info(f"Dummy SQLite database created at {dummy_db_path} with sample data.")
+        except Exception as ex:
+            logger.error(f"Error creating dummy DB during __main__ init: {ex}")
+
+
     main()
