@@ -1,186 +1,24 @@
-Production-Ready JMeter Test Script Generator from Swagger & MySQL
+### **Project Master Prompt: AI-Powered JMeter Script Generator**
 
-Introduction
+**Project Overview:**
+This document contains the complete and final state of the AI-Powered JMeter Script Generator project. The goal is to create a robust Streamlit application that uses a "Code-First, AI-Assisted" hybrid model to generate complex, data-driven JMeter test plans. The user provides an API specification, a database schema, and sample database data. The application then uses a single, focused AI call to perform semantic data mapping and uses deterministic Python code to assemble the final test plan and all associated artifacts.
 
-YOU ARE a SENIOR PERFORMANCE TEST ENGINEER, highly experienced in building robust, scalable, and fully correlated JMeter test plans for REST APIs backed by relational databases.
+**Final Architecture (Code-First, AI-Assist Hybrid Model):**
+This architecture was chosen to be resilient against the token and rate limits of free-tier LLM APIs, following a rigorous debugging process.
 
-(Context: "You are building the core logic for a Streamlit app that enables automatic JMeter script creation from any Swagger URL and any MySQL database connection. Each pair is fully isolated.")
+1.  **Step 1: Code-Driven Endpoint Filtering & Parameter Collection (in `app.py`):** The application first reads the uploaded Swagger file using Python. It reliably filters the endpoints based on the user's text prompt (e.g., "all GET endpoints"). It then programmatically collects all unique parameter names from these filtered endpoints. This step uses no AI and is 100% accurate.
 
-Task Description
+2.  **Step 2: Focused AI-Powered Data Mapping (in `utils/data_mapper.py`):** The application makes a **single, small, and fast AI call**.
+    *   **Input:** Only the list of unique parameter names and the database schema.
+    *   **Task:** The AI's only job is to return a JSON dictionary mapping the parameter names to the most semantically appropriate database table and column (e.g., mapping `appcd` to `Client.ApplicationCD`).
+    *   **Benefit:** This prompt is extremely small and avoids all API token and rate limit errors.
 
-YOUR TASK is to automatically generate a .jmx JMeter script by:
+3.  **Step 3: Code-Driven Test Case Assembly (in `app.py`):** With the AI's mapping dictionary, the application then programmatically loops through the filtered endpoints from Step 1. For each endpoint, it builds a complete test case object, including:
+    *   A unique name in the format `METHOD - /path/to/endpoint`.
+    *   Default headers (e.g., `Content-Type`).
+    *   Placeholders for authentication (e.g., `Authorization: Bearer ${authToken}`).
+    *   Default assertions (e.g., Response Code 200).
+    *   Placeholder extractions for correlation.
+    *   The correctly formatted `${csv_TableName_ColumnName}` variables for all mapped parameters.
 
-Parsing the provided Swagger API spec
-
-Connecting to the provided MySQL database
-
-Mapping API parameters to DB fields
-
-Applying dynamic correlation
-
-Referencing all variables as ${varname}
-
-Structuring the test plan in logical scenarios
-
-Adding field-level assertions
-
-Allowing configuration of threads, ramp-up, and loops
-
-Optionally including teardown logic
-
-Execution Plan Overview
-
-Step 1: Swagger Spec Parsing
-
-LOAD the Swagger JSON (swagger_link) → Identify:
-
-All paths and HTTP methods
-
-Parameters (path, query, body)
-
-Response schemas and fields
-
-Authentication flows (securitySchemes)
-
-Step 2: MySQL Schema Introspection
-
-CONNECT to MySQL using:
-
-db_server_name, db_username, db_password
-
-FETCH:
-
-Tables, columns, data types, constraints
-
-Foreign key relationships
-
-Up to 3 sample rows per table
-
-Step 3: Parameter Mapping
-
-MATCH each API input parameter to a DB column (by name, structure)
-
-CLASSIFY:
-
-CSV-fed: from DB sample
-
-Extracted: from API response
-
-Generated: UUIDs, timestamps
-
-USE JMeter variables ${varname} consistently
-
-Step 4: Scenario-Based Flow Construction
-
-Divide the script into 4 logical groups:
-
-🔐 Setup: Authentication, environment prep
-
-⚙️ Core Actions: Main test flow, e.g., create → update → fetch
-
-✅ Validation: Confirm outputs, DB state, status & field assertions
-
-🧹 Teardown (Optional): Delete data, logout, cleanup calls
-
-Ensure endpoint dependencies are respected (e.g., don’t use user_id before it’s extracted)
-
-Step 5: Correlation & Variable Handling
-
-EXTRACT values (e.g., ID, token) using JSON Extractor or Regex Extractor
-
-INJECT those into subsequent requests via ${varname}
-
-All input parameters must be:
-
-Sourced via extraction
-
-Pulled from CSV
-
-Or explicitly marked <<STATIC_SAMPLE>>
-
-Step 6: Parameterization & Load Configuration
-
-Include:
-
-CSV DataSetConfig for dynamic inputs
-
-User-defined:
-
-num_threads
-
-ramp_up_time
-
-loop_count
-
-Ensure data is per-thread-safe (if needed)
-
-Step 7: Assertion & Error Handling
-
-For each API call:
-
-✅ Status code assertion (200/201/204)
-
-✅ JSON field value check (e.g., "status": "success")
-
-⚠️ Optional: Retry logic (max 2 attempts)
-
-❌ Exit test or group on critical failure
-
-Step 8: Output Artifacts
-
-Generate:
-
-📦 Final .jmx file
-
-📑 YAML or JSON mapping:
-
-Parameter → Source (CSV/Extracted/Generated)
-
-Final ${varname} reference
-
-Endpoint grouping
-
-Warnings for unmapped fields
-
-Inputs
-
-swagger_link: Swagger/OpenAPI JSON
-
-db_server_name: Host/IP of MySQL server
-
-db_username: MySQL user
-
-db_password: Password
-
-Optional:
-
-num_threads
-
-ramp_up_time
-
-loop_count
-
-Output
-
-✅ Fully configured .jmx test script
-
-✅ YAML/JSON variable mapping + scenario breakdown
-
-✅ Optional logs of warnings or fallback defaults
-
-IMPORTANT
-
-"Each Swagger+DB pair is independent. Never reuse assumptions, schemas, or values."
-
-"Every input must be parameterized with ${varname}, and its source (CSV, extractor, static) must be defined."
-
-"Scenarios must be structured logically, respecting data dependencies, and all requests should be correlated and asserted."
-
-EXAMPLES of required response
-
-POST /users→ Send ${name}, ${email} (CSV)→ Extract user_id from response→ Use ${user_id} in GET /users/${user_id}
-
-POST /auth/login→ Extract token via JSON Extractor→ Inject as header Authorization: Bearer ${token} in all protected endpoints
-
-PUT /products/${product_id}→ Get product_id from DB sample via CSV→ Send update payload ${price}, ${description}→ Assert response has "status": "updated"
-
+4.  **Step 4: Artifact Generation (in `utils/jmeter_generator.py`):** The final, code-assembled test plan is passed to the JMX generator, which translates it into the `test_plan.jmx`, all necessary `.csv` files, and the YAML/JSON design documents. The JMX is generated with a compliant structure to avoid GUI errors in JMeter.
