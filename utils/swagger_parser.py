@@ -2,7 +2,7 @@ import requests
 import json
 from typing import Dict, List, Any, Optional, Union
 import logging
-from dataclasses import dataclass, field  # <--- THIS IS THE MISSING LINE
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -19,39 +19,31 @@ class SwaggerEndpoint:
     responses: Dict[str, Any] = field(default_factory=dict)
     security_schemes: List[Dict[str, Any]] = field(default_factory=list)
 
-    def to_dict(self):
-        return {
-            "method": self.method, "path": self.path, "operation_id": self.operation_id,
-            "summary": self.summary, "description": self.description, "parameters": self.parameters,
-            "body_schema": self.body_schema, "responses": self.responses, "security_schemes": self.security_schemes,
-        }
-
 
 class SwaggerParser:
     def __init__(self, spec_input: Union[str, Dict]):
         self.spec_input = spec_input
         self.swagger_data: Dict[str, Any] = {}
         self.definitions: Dict[str, Any] = {}
-        self.components_schemas: Dict[str, Any] = {}
+        self.components: Dict[str, Any] = {}
 
     def load_swagger_spec(self) -> bool:
         try:
-            if isinstance(self.spec_input, str):  # Handle URL
+            if isinstance(self.spec_input, str):
                 response = requests.get(self.spec_input)
                 response.raise_for_status()
                 self.swagger_data = response.json()
-            elif isinstance(self.spec_input, dict):  # Handle pre-loaded dictionary
+            elif isinstance(self.spec_input, dict):
                 self.swagger_data = self.spec_input
             else:
-                logger.error("Invalid input for SwaggerParser. Must be a URL string or a dictionary.")
+                logger.error("Invalid input for SwaggerParser.")
                 return False
 
             if 'swagger' in self.swagger_data and self.swagger_data['swagger'].startswith('2.0'):
                 self.definitions = self.swagger_data.get('definitions', {})
             elif 'openapi' in self.swagger_data and self.swagger_data['openapi'].startswith('3.'):
-                self.components_schemas = self.swagger_data.get('components', {}).get('schemas', {})
+                self.components = self.swagger_data.get('components', {})
             else:
-                logger.warning("Unsupported Swagger/OpenAPI version or malformed spec.")
                 return False
             return True
         except Exception as e:
@@ -59,16 +51,18 @@ class SwaggerParser:
             return False
 
     def _resolve_ref(self, ref_path: str) -> Dict[str, Any]:
-        parts = ref_path.replace('#/', '').split('/')
-        if ref_path.startswith('#/definitions/'):
-            current_def = self.definitions
-            for part in parts[1:]: current_def = current_def.get(part, {})
-            return current_def
-        elif ref_path.startswith('#/components/schemas/'):
-            current_def = self.components_schemas
-            for part in parts[2:]: current_def = current_def.get(part, {})
-            return current_def
-        return {}
+        if not ref_path.startswith('#/'):
+            return {}  # External refs not supported for simplicity
+
+        parts = ref_path[2:].split('/')
+        current_node = self.swagger_data
+        try:
+            for part in parts:
+                current_node = current_node[part]
+            return current_node
+        except (KeyError, TypeError):
+            logger.warning(f"Could not resolve $ref: {ref_path}")
+            return {}
 
     def parse(self) -> List[SwaggerEndpoint]:
         if not self.swagger_data and not self.load_swagger_spec():
@@ -77,24 +71,57 @@ class SwaggerParser:
         endpoints: List[SwaggerEndpoint] = []
         paths = self.swagger_data.get('paths', {})
 
-        for path, path_details in paths.items():
-            for method, details in path_details.items():
-                if method.lower() not in ['get', 'post', 'put', 'delete', 'patch']: continue
+        for path, path_item in paths.items():
+            common_parameters = [self._resolve_ref(p['$ref']) if '$ref' in p else p for p in
+                                 path_item.get('parameters', [])]
 
-                body_schema_resolved = None
-                if 'requestBody' in details and 'content' in details.get('requestBody', {}):
-                    content = details['requestBody']['content']
-                    if 'application/json' in content and 'schema' in content['application/json']:
-                        schema_raw = content['application/json']['schema']
-                        body_schema_resolved = self._resolve_ref(
-                            schema_raw.get('$ref', '')) if '$ref' in schema_raw else schema_raw
+            for method, operation in path_item.items():
+                if method.lower() not in ['get', 'post', 'put', 'delete', 'patch']:
+                    continue
+
+                # --- Body Schema Parsing (Robust) ---
+                body_schema = None
+                if 'requestBody' in operation:
+                    request_body = operation['requestBody']
+                    if '$ref' in request_body:
+                        request_body = self._resolve_ref(request_body['$ref'])
+
+                    content = request_body.get('content', {})
+                    # Prioritize application/json
+                    media_type = content.get('application/json') or content.get('application/json-patch+json') or next(
+                        iter(content.values()), None)
+
+                    if media_type and 'schema' in media_type:
+                        schema_node = media_type['schema']
+                        if '$ref' in schema_node:
+                            body_schema = self._resolve_ref(schema_node['$ref'])
+                        else:
+                            body_schema = schema_node
+
+                # --- Parameter Parsing (Robust) ---
+                operation_parameters = [self._resolve_ref(p['$ref']) if '$ref' in p else p for p in
+                                        operation.get('parameters', [])]
+
+                # Combine common and operation-specific parameters, ensuring no duplicates
+                all_params = {p['name']: p for p in common_parameters}
+                for p in operation_parameters:
+                    all_params[p['name']] = p
+
+                # Ensure type info is present for heuristics
+                for p in all_params.values():
+                    if 'schema' in p and 'type' in p['schema']:
+                        p['type'] = p['schema']['type']
 
                 endpoints.append(
                     SwaggerEndpoint(
-                        method=method.upper(), path=path, operation_id=details.get('operationId'),
-                        summary=details.get('summary'), parameters=details.get('parameters', []),
-                        responses=details.get('responses', {}), security_schemes=details.get('security', []),
-                        body_schema=body_schema_resolved
+                        method=method.upper(),
+                        path=path,
+                        operation_id=operation.get('operationId'),
+                        summary=operation.get('summary'),
+                        parameters=list(all_params.values()),
+                        body_schema=body_schema,
+                        responses=operation.get('responses', {}),
+                        security_schemes=operation.get('security', [])
                     )
                 )
         return endpoints

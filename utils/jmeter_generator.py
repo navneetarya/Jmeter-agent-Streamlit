@@ -65,22 +65,27 @@ class JMeterScriptGenerator:
                           "testclass": "HTTPSamplerProxy", "testname": unique_name, "enabled": "true"}
         sampler = self._create_element(parent_hash_tree, "HTTPSamplerProxy", sampler_attrib)
         sampler_hash_tree = self._create_element(parent_hash_tree, "hashTree")
-        self._create_element(sampler, "boolProp", {"name": "HTTPSampler.postBodyRaw"},
-                             "true" if request_config.get("body") else "false")
+
+        # --- START: CORRECTED BODY/PARAMETER LOGIC ---
+        has_body = request_config.get("body") is not None
+        self._create_element(sampler, "boolProp", {"name": "HTTPSampler.postBodyRaw"}, "true" if has_body else "false")
+
         arguments_element = self._create_element(sampler, "elementProp",
                                                  {"name": "HTTPsampler.Arguments", "elementType": "Arguments",
                                                   "guiclass": "HTTPArgumentsPanel", "testclass": "Arguments",
                                                   "enabled": "true"})
         arguments_collection_prop = self._create_element(arguments_element, "collectionProp",
                                                          {"name": "Arguments.arguments"})
-        if request_config.get("body"):
+        # 1. Add Body data if it exists
+        if has_body:
             arg_elem = self._create_element(arguments_collection_prop, "elementProp",
                                             {"name": "", "elementType": "HTTPArgument"})
             self._create_element(arg_elem, "boolProp", {"name": "HTTPArgument.always_encode"}, "false")
-            body_str = json.dumps(request_config["body"]) if isinstance(request_config["body"], (dict, list)) else str(
-                request_config["body"])
+            body_str = json.dumps(request_config["body"], indent=2)  # Pretty print body
             self._create_element(arg_elem, "stringProp", {"name": "Argument.value"}, body_str)
             self._create_element(arg_elem, "stringProp", {"name": "Argument.metadata"}, "=")
+
+        # 2. Add Query parameters (which are now correctly separated)
         if request_config.get("parameters") and isinstance(request_config["parameters"], list):
             for param_obj in request_config["parameters"]:
                 if isinstance(param_obj, dict) and "name" in param_obj and "value" in param_obj:
@@ -89,6 +94,9 @@ class JMeterScriptGenerator:
                     self._create_element(arg_elem, "boolProp", {"name": "HTTPArgument.always_encode"}, "true")
                     self._create_element(arg_elem, "stringProp", {"name": "Argument.value"}, str(param_obj["value"]))
                     self._create_element(arg_elem, "stringProp", {"name": "Argument.metadata"}, "=")
+                    self._create_element(arg_elem, "boolProp", {"name": "HTTPArgument.use_equals"}, "true")
+        # --- END: CORRECTED BODY/PARAMETER LOGIC ---
+
         self._create_element(sampler, "stringProp", {"name": "HTTPSampler.path"}, request_config.get("path", "/"))
         self._create_element(sampler, "stringProp", {"name": "HTTPSampler.method"},
                              request_config.get("method", "GET").upper())
@@ -121,20 +129,37 @@ class JMeterScriptGenerator:
                 self._create_element(sampler_hash_tree, "hashTree")
         if request_config.get("assertions"):
             for assertion_config in request_config["assertions"]:
-                assertion_test_field = "Assertion.response_code" if assertion_config.get(
-                    "type") == "response_code" else "Assertion.response_data"
-                assertion_test_type = "16" if assertion_config.get("type") == "response_code" else "2"
-                assertion = self._create_element(sampler_hash_tree, "ResponseAssertion",
-                                                 {"elementType": "ResponseAssertion", "guiclass": "AssertionGui",
-                                                  "testclass": "ResponseAssertion",
-                                                  "testname": f"Assert {assertion_config.get('type')}",
-                                                  "enabled": "true"})
-                string_prop_field = self._create_element(assertion, "collectionProp", {"name": "Asserion.test_strings"})
-                self._create_element(string_prop_field, "stringProp", {"name": "pattern"},
-                                     str(assertion_config.get("pattern", "")))
-                self._create_element(assertion, "stringProp", {"name": "Assertion.test_field"}, assertion_test_field)
-                self._create_element(assertion, "boolProp", {"name": "Assertion.assume_success"}, "false")
-                self._create_element(assertion, "intProp", {"name": "Assertion.test_type"}, assertion_test_type)
+                is_json_path_assert = assertion_config.get("json_path_assertion", False)
+                if is_json_path_assert:
+                    # JSON Path Assertion
+                    assertion = self._create_element(sampler_hash_tree, "JSONPathAssertion",
+                                                     {"elementType": "JSONPathAssertion",
+                                                      "guiclass": "JSONPathAssertionGui",
+                                                      "testclass": "JSONPathAssertion",
+                                                      "testname": f"Assert JSON Path Exists: {assertion_config.get('pattern')}",
+                                                      "enabled": "true"})
+                    self._create_element(assertion, "stringProp", {"name": "JSON_PATH"},
+                                         str(assertion_config.get("pattern", "")))
+                    self._create_element(assertion, "boolProp", {"name": "EXPECT_NULL"}, "false")
+                    self._create_element(assertion, "boolProp", {"name": "VALIDATE_JSON"}, "true")
+                else:
+                    # Response Code/Text Assertion
+                    assertion_test_field = "Assertion.response_code" if assertion_config.get(
+                        "type") == "response_code" else "Assertion.response_data"
+                    assertion_test_type = "16" if assertion_config.get("type") == "response_code" else "2"
+                    assertion = self._create_element(sampler_hash_tree, "ResponseAssertion",
+                                                     {"elementType": "ResponseAssertion", "guiclass": "AssertionGui",
+                                                      "testclass": "ResponseAssertion",
+                                                      "testname": f"Assert {assertion_config.get('type')}",
+                                                      "enabled": "true"})
+                    string_prop_field = self._create_element(assertion, "collectionProp",
+                                                             {"name": "Asserion.test_strings"})
+                    self._create_element(string_prop_field, "stringProp", {"name": "pattern"},
+                                         str(assertion_config.get("pattern", "")))
+                    self._create_element(assertion, "stringProp", {"name": "Assertion.test_field"},
+                                         assertion_test_field)
+                    self._create_element(assertion, "boolProp", {"name": "Assertion.assume_success"}, "false")
+                    self._create_element(assertion, "intProp", {"name": "Assertion.test_type"}, assertion_test_type)
                 self._create_element(sampler_hash_tree, "hashTree")
 
     def _add_csv_data_set_config(self, parent_hash_tree: ET.Element, filename: str, variable_names: List[str]):
@@ -145,7 +170,11 @@ class JMeterScriptGenerator:
         self._create_element(parent_hash_tree, "hashTree")
         self._create_element(csv_data_set, "stringProp", {"name": "filename"}, filename)
         self._create_element(csv_data_set, "stringProp", {"name": "fileEncoding"}, "UTF-8")
-        self._create_element(csv_data_set, "stringProp", {"name": "variableNames"}, ",".join(variable_names))
+        # --- START: CSV HEADER FIX ---
+        # Clean up variable names to remove any whitespace or newlines
+        cleaned_variable_names = [name.strip() for name in variable_names]
+        self._create_element(csv_data_set, "stringProp", {"name": "variableNames"}, ",".join(cleaned_variable_names))
+        # --- END: CSV HEADER FIX ---
         self._create_element(csv_data_set, "boolProp", {"name": "ignoreFirstLine"}, "false")
         self._create_element(csv_data_set, "boolProp", {"name": "quotedData"}, "true")
         self._create_element(csv_data_set, "boolProp", {"name": "recycle"}, "true")
@@ -233,16 +262,18 @@ class JMeterScriptGenerator:
                         jmeter_df[jmeter_variable_name] = df_table[col]
                     csv_files[csv_filename] = jmeter_df.to_csv(index=False)
 
-        # --- CORRECTED: Logic to extract server details from raw spec ---
         protocol, domain, port = "https", "example.com", ""
         if isinstance(full_swagger_spec, dict):
             host = full_swagger_spec.get('host')
             schemes = full_swagger_spec.get('schemes', ['https'])
-            protocol = schemes[0]
+            protocol = schemes[0] if schemes else 'https'
             if host:
-                parsed_url = urlparse(f"//{host}")
+                if '://' not in host:
+                    host = f"{protocol}://{host}"
+                parsed_url = urlparse(host)
                 domain = parsed_url.hostname or domain
-                port = str(parsed_url.port or "")
+                port_val = parsed_url.port
+                port = str(port_val) if port_val else ""
 
         generator = cls(test_plan_name=test_plan_name, thread_group_name=thread_group_name)
         root = ET.Element("jmeterTestPlan", {"version": "1.2", "properties": "5.0", "jmeter": "5.6.2"})
@@ -275,8 +306,10 @@ class JMeterScriptGenerator:
         generator._add_http_request_defaults(thread_group_hash_tree, protocol, domain, port)
 
         for filename, content in csv_files.items():
-            header = content.split('\n', 1)[0]
+            # --- START: CSV HEADER FIX ---
+            header = content.split('\n', 1)[0].strip()
             variable_names = header.split(',')
+            # --- END: CSV HEADER FIX ---
             generator._add_csv_data_set_config(thread_group_hash_tree, filename, variable_names)
 
         for case in designed_test_cases:
