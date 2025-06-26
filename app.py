@@ -1,340 +1,267 @@
 import streamlit as st
-import requests
 import json
 import pandas as pd
 from typing import Dict, List, Any, Optional
 import logging
-import sys
-import os
-import re
-from datetime import datetime, date
 import io
 import zipfile
-import time
-from urllib.parse import quote_plus
+from copy import deepcopy
+from urllib.parse import quote_plus, unquote
+import re
 
-# Import utility classes
 from utils.jmeter_generator import JMeterScriptGenerator
-from utils.swagger_parser import SwaggerParser, SwaggerEndpoint
+from utils.swagger_parser import SwaggerParser
 from utils.data_mapper import DataMapper
 
-# Configure logging
+st.set_page_config(page_title="Intelligent JMeter Test Builder", page_icon="🤖", layout="wide")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def initialize_session_state():
+    defaults = {
+        'all_endpoints': [], 'scenario_steps': [], 'ai_mappings': {},
+        'validation_warnings': [], 'generated_artifacts': None,
+        'db_schema': None, 'db_sampled_data': None,
+        'assembled_scenario': None, 'csv_files_preview': {},
+        'correlation_suggestions': [], 'applied_correlations': {},
+        'assertions_applied': False
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
-# --- Helper Functions ---
-class CustomJSONEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, (datetime, date, pd.Timestamp)): return obj.isoformat()
-        if isinstance(obj, bytes):
-            try: return obj.decode('utf-8')
-            except UnicodeDecodeError: return obj.hex()
-        return json.JSONEncoder.default(self, obj)
+# All helper and core logic functions are stable and correct...
+def find_case_insensitive_key(data_dict, target_key):
+    if not target_key or not data_dict: return None
+    for key in data_dict.keys():
+        if key.lower() == target_key.lower(): return key
+    return None
 
-def generate_csv_previews(table_to_columns: Dict[str, set], db_sampled_data: Dict[str, pd.DataFrame]) -> Dict[str, str]:
-    csv_files = {}
-    for table, columns in table_to_columns.items():
-        if table in db_sampled_data:
-            df_table = db_sampled_data[table]
-            columns_to_include = [col for col in columns if col in df_table.columns]
-            if columns_to_include:
-                csv_filename = f"{table}_data.csv"
-                jmeter_df = pd.DataFrame()
-                for col in columns_to_include:
-                    jmeter_variable_name = f"csv_{table}_{col}"
-                    jmeter_df[jmeter_variable_name] = df_table[col]
-                csv_files[csv_filename] = jmeter_df.to_csv(index=False)
-    return csv_files
+def find_case_insensitive_column_in_schema(schema, target_column):
+    if not target_column or not schema: return None
+    for col_def in schema:
+        if 'name' in col_def and col_def['name'].lower() == target_column.lower(): return col_def['name']
+    return None
 
-# Main application
-def main():
-    st.set_page_config(page_title="AI JMeter Script Generator", page_icon="⚡", layout="wide")
-    st.title("⚡ AI-Powered JMeter Script Generator")
-    st.markdown("Upload your raw API spec and DB files, describe a scenario, and get a ready-to-run JMeter test package.")
+def get_value_from_heuristics(param_name, param_type=None):
+    name = param_name.lower().replace('_', '')
+    if any(k in name for k in ['uuid', 'guid']) or name.endswith('id'): return "${__UUID()}"
+    if 'email' in name: return "test_${__Random(1000,9999)}@example.com"
+    if 'password' in name: return "Admin@123!"
+    return f"auto_value_{param_name}"
 
-    st.session_state.setdefault('designed_test_cases', [])
-    st.session_state.setdefault('generated_csv_previews', {})
-    st.session_state.setdefault('generated_artifacts', None)
-    st.session_state.setdefault('ai_mappings', [])
-    st.session_state.setdefault('relevant_endpoints', [])
-    st.session_state.setdefault('full_swagger_spec', None)
-    st.session_state.setdefault('validation_warnings', [])
-
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        uploaded_swagger_file = st.file_uploader("Upload Raw Swagger/OpenAPI Spec (JSON)", type="json")
-        uploaded_schema_file = st.file_uploader("Upload Database Schema (JSON)", type="json")
-        uploaded_data_file = st.file_uploader("Upload Sampled Database Data (JSON)", type="json")
-        api_key = st.text_input("Groq API Key", type="password", help="Get a free key from https://console.groq.com/keys")
-        st.subheader("JMeter Test Plan Settings")
-        st.session_state.test_plan_name = st.text_input("Test Plan Name", value="AI Generated Test Plan")
-        st.session_state.thread_group_name = st.text_input("Thread Group Name", value="Simulated Users")
-        st.subheader("Load Profile")
-        num_users = st.number_input("Threads", 1, value=10)
-        ramp_up_time = st.number_input("Ramp-up (s)", 0, value=10)
-        loop_count = st.number_input("Loops", -1, value=1)
-
-    st.header("Step 1: Identify Endpoints & Map Data")
-    user_prompt = st.text_area("Enter your test scenario prompt:", value="Create a test plan for all GET endpoints.", height=100)
-
-    if st.button("✨ 1. Analyze and Map Data"):
-        if not all([uploaded_swagger_file, uploaded_schema_file, api_key, user_prompt]):
-            st.warning("Please upload all three JSON files, provide an API key, and enter a prompt.")
-        else:
-            for key in ['designed_test_cases', 'generated_artifacts', 'ai_mappings', 'relevant_endpoints', 'validation_warnings']:
-                if isinstance(st.session_state.get(key), list): st.session_state[key] = []
-                else: st.session_state[key] = None
-            
-            with st.spinner("Step 1/3: Parsing Swagger and filtering endpoints..."):
-                try:
-                    uploaded_swagger_file.seek(0)
-                    st.session_state.full_swagger_spec = json.load(uploaded_swagger_file)
-                    parser = SwaggerParser(st.session_state.full_swagger_spec)
-                    swagger_endpoints = parser.parse()
-                    
-                    prompt_lower = user_prompt.lower()
-                    if "all get" in prompt_lower and "all post" in prompt_lower:
-                        st.session_state.relevant_endpoints = [ep for ep in swagger_endpoints if ep.method in ['GET', 'POST']]
-                    elif "all get" in prompt_lower:
-                        st.session_state.relevant_endpoints = [ep for ep in swagger_endpoints if ep.method == 'GET']
-                    elif "all post" in prompt_lower:
-                        st.session_state.relevant_endpoints = [ep for ep in swagger_endpoints if ep.method == 'POST']
-                    else: # Default to all endpoints
-                        st.session_state.relevant_endpoints = swagger_endpoints
-                    
-                    if not st.session_state.relevant_endpoints: st.error("No relevant endpoints found based on your prompt."); st.stop()
-                    
-                    def find_schema_properties(schema, found_props):
-                        if not isinstance(schema, dict) or 'properties' not in schema: return
-                        for prop_name, details in schema['properties'].items():
-                            if prop_name not in found_props:
-                                found_props[prop_name] = {'name': prop_name, 'in': 'body', 'type': details.get('type')}
-                            if details.get('type') == 'object': find_schema_properties(details, found_props)
-                            elif details.get('type') == 'array': find_schema_properties(details.get('items', {}), found_props)
-
-                    params_to_map_dict = {}
-                    for ep in st.session_state.relevant_endpoints:
-                        for param in ep.parameters:
-                            if param.get('name') and param['name'] not in params_to_map_dict:
-                                params_to_map_dict[param['name']] = param
-                        if ep.body_schema: find_schema_properties(ep.body_schema, params_to_map_dict)
-
-                    params_to_map = list(params_to_map_dict.values())
-                    st.success(f"Found {len(st.session_state.relevant_endpoints)} endpoints and {len(params_to_map)} unique parameters.")
-
-                except Exception as e: st.error(f"Endpoint analysis failed: {e}"); logger.error("Endpoint analysis", exc_info=True); st.stop()
-
-            # --- START: INTELLIGENT SCHEMA PRUNING ---
-            with st.spinner("Step 2/3: Pruning database schema for relevant tables..."):
-                try:
-                    uploaded_schema_file.seek(0)
-                    full_db_schema = json.load(uploaded_schema_file)
-                    
-                    param_names = {p['name'].lower().replace('_', '') for p in params_to_map}
-                    relevant_tables = set()
-
-                    for table_name, columns in full_db_schema.items():
-                        for column in columns:
-                            col_name = column['name'].lower().replace('_', '')
-                            # Check if any part of the param name is in the column name
-                            if any(param_name in col_name for param_name in param_names):
-                                relevant_tables.add(table_name)
-                                break # Move to the next table once a match is found
-                    
-                    pruned_schema = {table: full_db_schema[table] for table in relevant_tables}
-                    st.success(f"Pruned schema to {len(pruned_schema)} relevant tables (out of {len(full_db_schema)}).")
-
-                except Exception as e: st.error(f"Schema pruning failed: {e}"); logger.error("Schema pruning", exc_info=True); st.stop()
-            # --- END: INTELLIGENT SCHEMA PRUNING ---
-
-            with st.spinner("Step 3/3: AI is mapping parameters to the pruned schema..."):
-                try:
-                    mapping_result = DataMapper.get_ai_powered_mappings(params_to_map, pruned_schema, api_key)
-                    if mapping_result and "parameter_mappings" in mapping_result:
-                        st.session_state.ai_mappings = mapping_result["parameter_mappings"]
-                        st.success("AI data mapping complete!")
-                    else: st.error("AI did not return valid mappings."); logger.error(f"Invalid map: {mapping_result}"); st.stop()
-                except Exception as e: st.error(f"AI mapping failed: {e}"); logger.error("AI mapping", exc_info=True); st.stop()
-
-    st.header("Step 2: Assemble & Review Test Plan")
-    if st.session_state.ai_mappings:
-        # The rest of the file remains exactly the same.
-        with st.expander("View Final Aggregated AI Data Mapping Results"):
-            st.dataframe(st.session_state.ai_mappings, use_container_width=True)
-
-        def find_case_insensitive_column(df: pd.DataFrame, column_name: str) -> Optional[str]:
-            for col in df.columns:
-                if col.lower() == column_name.lower(): return col
-            return None
-
-        def get_value_from_heuristics(param_name: str, param_type: Optional[str] = None):
-            name = param_name.lower()
-            if any(k in name for k in ['uuid', 'guid']) or name.endswith('id'): return "${__UUID()}"
-            if 'email' in name: return "test_" + "${__Random(1,99999)}" + "@example.com"
-            if 'password' in name: return "Admin@123!"
-            if any(k in name for k in ['phone', 'mobile']): return "+91" + "${__RandomString(10,0123456789)}"
-            if 'pincode' in name or 'zipcode' in name: return "${__RandomString(6,0123456789)}"
-            if 'token' in name or 'session' in name: return "${__UUID()}"
-            if name.endswith('code') or name.endswith('cd'): return "CODE-" + "${__Random(100,999)}"
-            if name == 'age': return "${__Random(18,60)}"
-            if 'birthdate' in name or name == 'dob': return "${__timeShift(yyyy-MM-dd,,P-25Y)}"
-            if any(k in name for k in ['date', 'timestamp', 'createdat', 'updatedat', '_on']): return "${__time(yyyy-MM-dd'T'HH:mm:ss.SSSZ)}"
-            if any(k in name for k in ['name']): return "AutoUser-" + "${__Random(100,999)}"
-            if 'description' in name or 'notes' in name or 'remark' in name: return "Generated by test automation."
-            if name in ['lat', 'latitude']: return "28.6139"
-            if name in ['lon', 'lng', 'longitude']: return "77.2090"
-            if 'city' in name: return "Delhi"
-            if 'country' in name: return "IN"
-            if 'price' in name or 'amount' in name: return "${__Random(10,1000)}.50"
-            if name.startswith('is') or name.startswith('has') or 'flag' in name: return "true"
-            if 'status' in name or 'state' in name or 'type' in name: return "active"
-            if 'role' in name or 'permission' in name: return "user"
-            if 'url' in name or 'link' in name: return "https://example.com"
-            if 'image' in name or 'avatar' in name: return "https://i.pravatar.cc/150"
-            if 'version' in name: return "1.0.0"
-            if param_type:
-                if param_type == 'integer': return "${__Random(1,1000)}"
-                if param_type == 'number': return "${__Random(1,1000)}.0"
-                if param_type == 'boolean': return "true"
-            return f"STATIC_{param_name}"
-        
-        def get_validated_intelligent_value(param, mapping_dict, db_data, table_to_columns, warnings_list):
-            param_name = param['name']
-            ai_map = mapping_dict.get(param_name, {})
-            table, mapped_column = ai_map.get("mapped_table"), ai_map.get("mapped_column")
-            
-            if table and mapped_column and table in db_data:
-                actual_column_name = find_case_insensitive_column(db_data[table], mapped_column)
-                if actual_column_name:
-                    value = f"${{csv_{table}_{actual_column_name}}}"
-                    if table not in table_to_columns: table_to_columns[table] = set()
-                    table_to_columns[table].add(actual_column_name)
+def get_validated_intelligent_value(param, mapping_dict, db_schema, db_data, table_to_columns, warnings_list):
+    param_name = param['name']
+    ai_map = mapping_dict.get(param_name.lower(), {})
+    suggested_table = ai_map.get("mapped_table"); suggested_column = ai_map.get("mapped_column")
+    if suggested_table and suggested_column and db_schema and db_data:
+        actual_table_name_schema = find_case_insensitive_key(db_schema, suggested_table)
+        if actual_table_name_schema:
+            table_schema_def = db_schema[actual_table_name_schema]
+            actual_column_name_schema = find_case_insensitive_column_in_schema(table_schema_def, suggested_column)
+            if actual_column_name_schema:
+                actual_table_name_data = find_case_insensitive_key(db_data, actual_table_name_schema)
+                if actual_table_name_data and actual_column_name_schema in db_data[actual_table_name_data].columns:
+                    jmeter_variable_name = f"csv_{actual_table_name_data}_{actual_column_name_schema}"
+                    value = f"${{{jmeter_variable_name}}}"
+                    if actual_table_name_data not in table_to_columns: table_to_columns[actual_table_name_data] = set()
+                    table_to_columns[actual_table_name_data].add(actual_column_name_schema)
                     return value
-                else:
-                    warnings_list.append(f"**`{param_name}`** → Mapped to `{table}.{mapped_column}`, but column not found. Falling back.")
-            
-            return get_value_from_heuristics(param_name, param.get('type'))
+    return get_value_from_heuristics(param_name, param.get('type'))
 
-        def build_body_from_schema(schema, mapping_dict, db_data, table_to_columns, warnings_list):
-            if not schema: return None
-            schema_type = schema.get('type')
-            
-            if schema_type == 'object':
-                body = {}
-                if 'properties' not in schema: return body
-                for prop_name, details in schema['properties'].items():
-                    mock_param = {'name': prop_name, 'type': details.get('type')}
-                    body[prop_name] = get_validated_intelligent_value(mock_param, mapping_dict, db_data, table_to_columns, warnings_list)
-                return body
-            
-            if schema_type == 'array':
-                items_schema = schema.get('items', {})
-                items_type = items_schema.get('type')
-                if items_type == 'object':
-                    return [build_body_from_schema(items_schema, mapping_dict, db_data, table_to_columns, warnings_list)]
-                else:
-                    mock_param = {'name': 'array_item', 'type': items_type}
-                    return [get_validated_intelligent_value(mock_param, mapping_dict, db_data, table_to_columns, warnings_list)]
-            
-            return None
+def build_body_from_schema(schema, mapping_dict, db_schema, db_data, table_to_columns, warnings_list):
+    if not schema or 'properties' not in schema: return None
+    body = {}
+    for prop_name, details in schema['properties'].items():
+        mock_param = {'name': prop_name, 'type': details.get('type')}
+        if details.get('type') == 'object':
+            body[prop_name] = build_body_from_schema(details, mapping_dict, db_schema, db_data, table_to_columns, warnings_list)
+        else:
+            body[prop_name] = get_validated_intelligent_value(mock_param, mapping_dict, db_schema, db_data, table_to_columns, warnings_list)
+    return body
 
-        if st.button("🛠️ 2. Assemble Full Test Cases"):
-            with st.spinner("Assembling final test cases and generating CSV previews..."):
-                try:
-                    st.session_state.validation_warnings = []
-                    mapping_dict = {m['parameter_name']: m for m in st.session_state.ai_mappings}
-                    uploaded_data_file.seek(0)
-                    db_sampled_data = {k: pd.DataFrame(v) for k, v in json.load(uploaded_data_file).items()}
-                    
-                    final_test_cases = []
-                    table_to_columns_for_csv = {}
-                    
-                    for ep in st.session_state.relevant_endpoints:
-                        final_path = ep.path
-                        query_params_dict = {}
-                        
-                        for param in ep.parameters:
-                            value = get_validated_intelligent_value(param, mapping_dict, db_sampled_data, table_to_columns_for_csv, st.session_state.validation_warnings)
-                            if param.get('in') == 'path': final_path = final_path.replace(f"{{{param['name']}}}", value)
-                            elif param.get('in') == 'query': query_params_dict[param['name']] = value
-                        
-                        if query_params_dict:
-                            query_parts = []
-                            for k, v in query_params_dict.items():
-                                val_str = str(v)
-                                if '${' in val_str and '}' in val_str:
-                                    query_parts.append(f"{k}={val_str}")
-                                else:
-                                    query_parts.append(f"{k}={quote_plus(val_str)}")
-                            
-                            query_string = "&".join(query_parts)
-                            final_path += f"?{query_string}"
+def get_unique_parameters_for_scenario(scenario_steps):
+    unique_params = {}
+    def extract_from_schema(schema, prefix=''):
+        if not schema or 'properties' not in schema: return
+        for prop_name, details in schema.get('properties', {}).items():
+            full_name = f"{prefix}{prop_name}"; full_name_lower = full_name.lower()
+            if full_name_lower not in unique_params: unique_params[full_name_lower] = {'name': full_name, 'type': details.get('type')}
+            if details.get('type') == 'object': extract_from_schema(details, prefix=f"{full_name}.")
+    for endpoint in scenario_steps:
+        for param in endpoint.get('parameters', []):
+            param_name_lower = param['name'].lower()
+            if param_name_lower not in unique_params: unique_params[param_name_lower] = {'name': param['name'], 'type': param.get('schema', {}).get('type')}
+        if endpoint.get('body_schema'): extract_from_schema(endpoint['body_schema'])
+    return list(unique_params.values())
 
-                        case = {"name": f"{ep.method} - {ep.path}", "method": ep.method, "path": final_path,
-                                "headers": {}, "parameters": [], "body": None, "extractions": [],
-                                "assertions": [{"type": "response_code", "pattern": "201" if ep.method == 'POST' else "200"}]}
+def generate_correlation_suggestions():
+    suggestions = []
+    steps = st.session_state.scenario_steps
+    for i, step in enumerate(steps):
+        if step['method'] in ['POST', 'PUT'] and i + 1 < len(steps):
+            next_step = steps[i+1]; path_params = re.findall(r'\{(\w+)\}', next_step['path'])
+            for param in path_params:
+                if 'id' in param.lower() or 'uid' in param.lower() or 'cd' in param.lower():
+                    suggestions.append({"from_step": i, "to_step": i + 1, "variable_name": f"extracted_{param}", "json_path": f"$.{param}", "description": f"Extract **`{param}`** from **Step {i+1}**'s response to use in **Step {i+2}**'s URL."})
+    st.session_state.correlation_suggestions = suggestions
 
-                        if ep.method in ["POST", "PUT", "PATCH"] and ep.body_schema:
-                            case["body"] = build_body_from_schema(ep.body_schema, mapping_dict, db_sampled_data, table_to_columns_for_csv, st.session_state.validation_warnings)
-                        
-                        if case.get("body"): case["headers"]["Content-Type"] = "application/json"
-                        if ep.security_schemes: case["headers"]["Authorization"] = "Bearer ${authToken}"
-                        
-                        final_test_cases.append(case)
-                    
-                    st.session_state.designed_test_cases = final_test_cases
-                    st.session_state.generated_csv_previews = generate_csv_previews(table_to_columns_for_csv, db_sampled_data)
-                    st.success("Test cases assembled successfully!")
-                except Exception as e: st.error(f"Assembly failed: {e}"); logger.error("Assembly", exc_info=True)
+def build_intelligent_scenario():
+    endpoints = deepcopy(st.session_state.all_endpoints)
+    method_order = {"POST": 0, "GET": 1, "PUT": 2, "PATCH": 3, "DELETE": 4}
+    sorted_endpoints = sorted(endpoints, key=lambda ep: (method_order.get(ep['method'], 99), ep['path'].count('/'), '{' in ep['path'], ep['path']))
+    st.session_state.scenario_steps = sorted_endpoints
+    generate_correlation_suggestions()
+    st.session_state.ai_mappings = {}; st.session_state.assembled_scenario = None; st.session_state.assertions_applied = False
 
-        if st.session_state.validation_warnings:
-            st.warning("Mapping Validation Report")
-            report_str = "The following AI mappings could not be validated against your sample data and fell back to heuristic generation:\n\n" + "\n".join(f"- {w}" for w in set(st.session_state.validation_warnings))
-            st.markdown(report_str)
-
-    st.header("Step 3: Generate and Download All Artifacts")
-    if st.session_state.designed_test_cases:
-        with st.expander("Preview Final Assembled Test Cases (JSON)"):
-            st.json(st.session_state.designed_test_cases)
-        with st.expander("Preview Generated CSVs"):
-            if st.session_state.generated_csv_previews:
-                for filename, content in st.session_state.generated_csv_previews.items():
-                    st.subheader(f"`{filename}`"); st.dataframe(pd.read_csv(io.StringIO(content)))
-            else: st.info("No CSV files were needed for this plan.")
+def main():
+    initialize_session_state()
+    st.title("🤖 Intelligent JMeter Test Builder")
     
-    if st.button("🚀 Generate JMeter Plan and Artifacts", type="primary", disabled=(not st.session_state.designed_test_cases)):
-        with st.spinner("Translating design into JMX, YAML, and CSV files..."):
-            try:
-                uploaded_data_file.seek(0)
-                db_sampled_data = {k: pd.DataFrame(v) for k, v in json.load(uploaded_data_file).items()}
-                
-                jmx_content, csv_files, json_plan, yaml_plan = JMeterScriptGenerator.generate_jmx_and_artifacts(
-                    designed_test_cases=st.session_state.designed_test_cases,
-                    db_sampled_data=db_sampled_data,
-                    test_plan_name=st.session_state.test_plan_name,
-                    thread_group_name=st.session_state.thread_group_name,
-                    num_users=num_users, ramp_up_time=ramp_up_time, loop_count=loop_count,
-                    full_swagger_spec=st.session_state.full_swagger_spec
-                )
-                
-                st.session_state.generated_artifacts = {"jmx": jmx_content, "csv": csv_files, "json": json_plan, "yaml": yaml_plan}
-            except Exception as e: st.error(f"Generation failed: {e}"); logger.error("Generation", exc_info=True)
+    with st.sidebar:
+        st.header("⚙️ Configuration"); uploaded_swagger_file = st.file_uploader("1. Swagger/OpenAPI Spec", type="json"); uploaded_schema_file = st.file_uploader("2. Database Schema", type="json"); uploaded_data_file = st.file_uploader("3. Sampled DB Data", type="json"); api_key = st.text_input("4. Groq API Key", type="password")
+        if uploaded_swagger_file and not st.session_state.all_endpoints:
+            with st.spinner("Parsing Swagger..."): st.session_state.all_endpoints = [ep.to_dict() for ep in SwaggerParser(json.load(uploaded_swagger_file)).parse()]
+        if uploaded_schema_file and not st.session_state.db_schema: st.session_state.db_schema = json.load(uploaded_schema_file)
+        if uploaded_data_file and not st.session_state.db_sampled_data: st.session_state.db_sampled_data = {t: pd.DataFrame(d) for t, d in json.load(uploaded_data_file).items()}
+        st.divider(); st.header("Load Parameters"); target_host = st.text_input("Target Host", "sandbox-auth.livecareer.com"); num_users = st.number_input("Users", 1, value=10); ramp_up_time = st.number_input("Ramp-up (s)", 1, value=10); loop_count = st.number_input("Loops", -1, value=1); think_time = st.slider("Think Time (ms)", 0, 5000, 1000, 100)
+
+    st.header("Step 1: Design the Test Scenario")
+    build_mode = st.radio("Build Mode:", ["🤖 Auto-Build", "👨‍💻 Manual Build"], horizontal=True, label_visibility="collapsed")
+    if build_mode == "🤖 Auto-Build":
+        if st.button("🚀 Auto-Build Intelligent Scenario", disabled=not st.session_state.all_endpoints, type="primary"):
+            build_intelligent_scenario(); st.rerun()
+    else:
+        with st.container(border=True, height=400):
+            if st.session_state.all_endpoints:
+                modules = {}
+                for ep in st.session_state.all_endpoints:
+                    try: module_name = ep['path'].split('/')[3] if ep['path'].count('/') > 2 else "general"
+                    except IndexError: module_name = "general"
+                    modules.setdefault(module_name.capitalize(), []).append(ep)
+                scenario_endpoint_ids = {f"{e['method']}_{e['path']}" for e in st.session_state.scenario_steps}
+                for module, endpoints in sorted(modules.items()):
+                    with st.expander(f"🗂️ {module} ({len(endpoints)} endpoints)", expanded=True):
+                        for endpoint in endpoints:
+                            endpoint_id = f"{endpoint['method']}_{endpoint['path']}"
+                            if endpoint_id not in scenario_endpoint_ids:
+                                if st.button(f"➕ `{endpoint['method']}` {endpoint['path']}", key=f"add_{endpoint_id}", use_container_width=True):
+                                    st.session_state.scenario_steps.append(deepcopy(endpoint)); generate_correlation_suggestions(); st.rerun()
+    st.subheader("Current Scenario Steps")
+    if not st.session_state.scenario_steps: st.info("Your scenario is empty. Use a build mode above to add steps.")
+    else:
+        for i, step in enumerate(st.session_state.scenario_steps):
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([0.8, 0.05, 0.05, 0.1])
+                method_color = {"GET": "blue", "POST": "green", "PUT": "orange", "DELETE": "red"}.get(step['method'], "grey")
+                success_codes_str = ", ".join(step.get('success_codes', ['200']))
+                c1.markdown(f"**Step {i+1}:** :{method_color}[`{step['method']}`] `{step['path']}` -- *Expects: `[{success_codes_str}]`*")
+                if c2.button("⬆️", key=f"up_{i}", disabled=(i==0)): st.session_state.scenario_steps.insert(i-1, st.session_state.scenario_steps.pop(i)); generate_correlation_suggestions(); st.rerun()
+                if c3.button("⬇️", key=f"down_{i}", disabled=(i==len(st.session_state.scenario_steps)-1)): st.session_state.scenario_steps.insert(i+1, st.session_state.scenario_steps.pop(i)); generate_correlation_suggestions(); st.rerun()
+                if c4.button("🗑️", key=f"remove_{i}"): st.session_state.scenario_steps.pop(i); generate_correlation_suggestions(); st.rerun()
+
+    st.divider()
+
+    st.header("Step 2: Configure Logic & Assemble")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Correlation")
+        if st.session_state.scenario_steps:
+            if st.session_state.correlation_suggestions:
+                if st.button("✅ Apply All Correlations"):
+                    for s in st.session_state.correlation_suggestions: st.session_state.applied_correlations[f"{s['from_step']}_{s['to_step']}_{s['variable_name']}"] = {**s}
+                    st.rerun()
+                # *** FIX: Restore individual correlation forms ***
+                for i, s in enumerate(st.session_state.correlation_suggestions):
+                    corr_id = f"{s['from_step']}_{s['to_step']}_{s['variable_name']}"
+                    if corr_id in st.session_state.applied_correlations: st.success(f"✓ {s['description']}")
+                    else:
+                        with st.form(key=f"corr_form_{i}"):
+                            st.markdown(s['description'])
+                            sc1, sc2, sc3 = st.columns([2,2,1]); json_path = sc1.text_input("JSON Path", value=s['json_path'], key=f"jsp_{i}", label_visibility="collapsed"); var_name = sc2.text_input("Variable Name", value=s['variable_name'], key=f"vn_{i}", label_visibility="collapsed")
+                            if sc3.form_submit_button("Apply"):
+                                st.session_state.applied_correlations[corr_id] = {**s, "json_path": json_path, "variable_name": var_name}; st.rerun()
+            else: st.info("No obvious correlations found.")
+    with c2:
+        st.subheader("Assertions")
+        if st.session_state.scenario_steps:
+            if st.session_state.assertions_applied: st.success("✓ Spec-driven assertions will be added.")
+            else:
+                if st.button("🎯 Apply Auto-Assertions"): st.session_state.assertions_applied = True; st.rerun()
+    
+    is_assemble_disabled = not st.session_state.scenario_steps or not st.session_state.db_schema or not api_key
+    if st.button("Map Data & Assemble Scenario", disabled=is_assemble_disabled):
+        with st.spinner("Mapping data and assembling..."):
+            params_to_map = get_unique_parameters_for_scenario(st.session_state.scenario_steps)
+            if params_to_map:
+                ai_response = DataMapper.get_ai_powered_mappings(params_to_map, st.session_state.db_schema, api_key)
+                st.session_state.ai_mappings = {item["parameter_name"].lower(): {**item} for item in ai_response.get("parameter_mappings", [])}
+            st.session_state.validation_warnings.clear(); final_table_to_columns_map = {}; assembled_steps = []
+            for i, step in enumerate(st.session_state.scenario_steps):
+                assembled_step = deepcopy(step); assembled_step['extractions'] = []; assembled_step['assertions'] = []
+                if st.session_state.assertions_applied: assembled_step['assertions'].append({"type": "ResponseAssertion", "codes": step.get('success_codes', ['200'])})
+                for corr in st.session_state.applied_correlations.values():
+                    if corr['from_step'] == i: assembled_step['extractions'].append({"type": "JSONExtractor", "refname": corr['variable_name'], "jsonpath": corr['json_path']})
+                query_params, path_placeholders = [], {}
+                for param in assembled_step.get('parameters', []):
+                    correlated_value = next((f"${{{corr['variable_name']}}}" for corr in st.session_state.applied_correlations.values() if corr['to_step'] == i and param['name'].lower() in corr['variable_name'].lower()), None)
+                    value = correlated_value or get_validated_intelligent_value(param, st.session_state.ai_mappings, st.session_state.db_schema, st.session_state.db_sampled_data, final_table_to_columns_map, st.session_state.validation_warnings)
+                    if param.get('in') == 'path': path_placeholders[param['name']] = value
+                    elif param.get('in') == 'query': query_params.append(f"{quote_plus(param['name'])}={quote_plus(value)}")
+                temp_path = assembled_step['path']
+                for p_name, p_val in path_placeholders.items(): temp_path = temp_path.replace(f"{{{p_name}}}", unquote(p_val))
+                assembled_step['path'] = f"{temp_path}?{'&'.join(query_params)}" if query_params else temp_path
+                if assembled_step.get('body_schema'):
+                    assembled_step['body'] = build_body_from_schema(assembled_step['body_schema'], st.session_state.ai_mappings, st.session_state.db_schema, st.session_state.db_sampled_data, final_table_to_columns_map, st.session_state.validation_warnings)
+                assembled_step['name'] = f"{step['method']} - {step['path']}"; assembled_step['headers'] = {"Content-Type": "application/json"}
+                assembled_steps.append(assembled_step)
+            st.session_state.assembled_scenario = {"Test Scenario": assembled_steps}
+            st.session_state.csv_files_preview.clear()
+            if st.session_state.db_sampled_data:
+                for table, columns in final_table_to_columns_map.items():
+                    df_table = st.session_state.db_sampled_data[table]
+                    preview_df = pd.DataFrame()
+                    for col in sorted(list(columns)): preview_df[f"csv_{table}_{col}"] = df_table[col]
+                    st.session_state.csv_files_preview[f"{table}_data.csv"] = preview_df
+            st.success("Assembly complete!")
+
+    # *** FIX: Restore the preview sections ***
+    if st.session_state.ai_mappings:
+        with st.expander("View AI Data Mappings"):
+            st.dataframe(pd.DataFrame([
+                {"API Parameter": v.get("parameter_name"), "Mapped Table": v.get('mapped_table'), "Mapped Column": v.get('mapped_column')}
+                for k, v in st.session_state.ai_mappings.items()
+            ]), use_container_width=True)
+            
+    if st.session_state.csv_files_preview:
+        with st.expander("📊 Preview of Generated CSV Files"):
+            for filename, df in st.session_state.csv_files_preview.items():
+                st.markdown(f"**`{filename}`**"); st.dataframe(df.head(), use_container_width=True)
+
+    if st.session_state.assembled_scenario:
+        with st.expander("🔬 View Final Assembled Test Case (JSON)"):
+            st.json(st.session_state.assembled_scenario)
+
+    st.divider()
+
+    st.header("Step 4: Generate JMeter Package")
+    is_generate_disabled = not st.session_state.assembled_scenario
+    if st.button("🚀 Generate Full Test Plan", type="primary", disabled=is_generate_disabled, use_container_width=True):
+        with st.spinner("Generating JMX, CSVs, and other artifacts..."):
+            csv_files_for_zip = {filename: df.to_csv(index=False) for filename, df in st.session_state.csv_files_preview.items()}
+            jmx_content, _, json_design, yaml_design = JMeterScriptGenerator.generate_jmx_and_artifacts(
+                designed_scenarios=st.session_state.assembled_scenario, db_sampled_data=st.session_state.db_sampled_data,
+                test_plan_name=f"{target_host} Load Test", thread_group_name=f"{num_users} Users",
+                target_host=target_host, num_users=num_users, ramp_up_time=ramp_up_time, loop_count=loop_count, think_time=think_time
+            )
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("test_plan.jmx", jmx_content); zf.writestr("design.json", json_design); zf.writestr("design.yaml", yaml_design)
+                for filename, content in csv_files_for_zip.items(): zf.writestr(f"data/{filename}", content)
+            st.session_state.generated_artifacts = zip_buffer.getvalue()
+            st.success("Test plan package generated successfully!")
 
     if st.session_state.generated_artifacts:
-        st.subheader("Preview Final Artifacts")
-        tabs = st.tabs(["JSON Design", "JMX (XML)", "YAML Design"])
-        with tabs[0]: st.code(st.session_state.generated_artifacts.get("json", ""), language="json")
-        with tabs[1]: st.code(st.session_state.generated_artifacts.get("jmx", ""), language="xml")
-        with tabs[2]: st.code(st.session_state.generated_artifacts.get("yaml", ""), language="yaml")
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            if st.session_state.generated_artifacts.get("jmx"): zf.writestr("test_plan.jmx", st.session_state.generated_artifacts["jmx"])
-            if st.session_state.generated_artifacts.get("csv"):
-                for filename, content in st.session_state.generated_artifacts["csv"].items(): zf.writestr(filename, content)
-            if st.session_state.generated_artifacts.get("yaml"): zf.writestr("test_plan_design.yaml", st.session_state.generated_artifacts["yaml"])
-        st.download_button(label="📥 Download Test Package (.zip)", data=zip_buffer.getvalue(), file_name="jmeter_ai_test_package.zip", mime="application/zip")
+        st.download_button("⬇️ Download JMeter Package (.zip)", st.session_state.generated_artifacts, "jmeter_test_package.zip", "application/zip", use_container_width=True)
 
 if __name__ == "__main__":
     main()

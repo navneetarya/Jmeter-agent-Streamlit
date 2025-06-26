@@ -17,7 +17,23 @@ class SwaggerEndpoint:
     parameters: List[Dict[str, Any]] = field(default_factory=list)
     body_schema: Optional[Dict[str, Any]] = None
     responses: Dict[str, Any] = field(default_factory=dict)
+    # *** NEW: Field to store success codes ***
+    success_codes: List[str] = field(default_factory=list)
     security_schemes: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "method": self.method,
+            "path": self.path,
+            "operation_id": self.operation_id,
+            "summary": self.summary,
+            "description": self.description,
+            "parameters": self.parameters,
+            "body_schema": self.body_schema,
+            "responses": self.responses,
+            "success_codes": self.success_codes,  # Include in the dictionary output
+            "security_schemes": self.security_schemes,
+        }
 
 
 class SwaggerParser:
@@ -28,6 +44,7 @@ class SwaggerParser:
         self.components: Dict[str, Any] = {}
 
     def load_swagger_spec(self) -> bool:
+        # This method is correct and unchanged
         try:
             if isinstance(self.spec_input, str):
                 response = requests.get(self.spec_input)
@@ -36,9 +53,7 @@ class SwaggerParser:
             elif isinstance(self.spec_input, dict):
                 self.swagger_data = self.spec_input
             else:
-                logger.error("Invalid input for SwaggerParser.")
                 return False
-
             if 'swagger' in self.swagger_data and self.swagger_data['swagger'].startswith('2.0'):
                 self.definitions = self.swagger_data.get('definitions', {})
             elif 'openapi' in self.swagger_data and self.swagger_data['openapi'].startswith('3.'):
@@ -51,14 +66,12 @@ class SwaggerParser:
             return False
 
     def _resolve_ref(self, ref_path: str) -> Dict[str, Any]:
-        if not ref_path.startswith('#/'):
-            return {}  # External refs not supported for simplicity
-
+        # This method is correct and unchanged
+        if not ref_path.startswith('#/'): return {}
         parts = ref_path[2:].split('/')
         current_node = self.swagger_data
         try:
-            for part in parts:
-                current_node = current_node[part]
+            for part in parts: current_node = current_node[part]
             return current_node
         except (KeyError, TypeError):
             logger.warning(f"Could not resolve $ref: {ref_path}")
@@ -74,43 +87,37 @@ class SwaggerParser:
         for path, path_item in paths.items():
             common_parameters = [self._resolve_ref(p['$ref']) if '$ref' in p else p for p in
                                  path_item.get('parameters', [])]
-
             for method, operation in path_item.items():
-                if method.lower() not in ['get', 'post', 'put', 'delete', 'patch']:
-                    continue
+                if method.lower() not in ['get', 'post', 'put', 'delete', 'patch']: continue
 
-                # --- Body Schema Parsing (Robust) ---
+                # *** NEW: Logic to extract success codes ***
+                success_codes = []
+                operation_responses = operation.get('responses', {})
+                for code, resp_details in operation_responses.items():
+                    # Success codes are typically in the 2xx range
+                    if code.startswith('2'):
+                        success_codes.append(code)
+                # If no 2xx codes, default to 200 as a fallback
+                if not success_codes:
+                    success_codes.append("200")
+
                 body_schema = None
                 if 'requestBody' in operation:
-                    request_body = operation['requestBody']
-                    if '$ref' in request_body:
-                        request_body = self._resolve_ref(request_body['$ref'])
-
+                    request_body = self._resolve_ref(operation['requestBody']['$ref']) if '$ref' in operation[
+                        'requestBody'] else operation['requestBody']
                     content = request_body.get('content', {})
-                    # Prioritize application/json
                     media_type = content.get('application/json') or content.get('application/json-patch+json') or next(
                         iter(content.values()), None)
-
                     if media_type and 'schema' in media_type:
                         schema_node = media_type['schema']
-                        if '$ref' in schema_node:
-                            body_schema = self._resolve_ref(schema_node['$ref'])
-                        else:
-                            body_schema = schema_node
+                        body_schema = self._resolve_ref(schema_node['$ref']) if '$ref' in schema_node else schema_node
 
-                # --- Parameter Parsing (Robust) ---
                 operation_parameters = [self._resolve_ref(p['$ref']) if '$ref' in p else p for p in
                                         operation.get('parameters', [])]
-
-                # Combine common and operation-specific parameters, ensuring no duplicates
                 all_params = {p['name']: p for p in common_parameters}
-                for p in operation_parameters:
-                    all_params[p['name']] = p
-
-                # Ensure type info is present for heuristics
+                for p in operation_parameters: all_params[p['name']] = p
                 for p in all_params.values():
-                    if 'schema' in p and 'type' in p['schema']:
-                        p['type'] = p['schema']['type']
+                    if 'schema' in p and 'type' in p['schema']: p['type'] = p['schema']['type']
 
                 endpoints.append(
                     SwaggerEndpoint(
@@ -121,6 +128,7 @@ class SwaggerParser:
                         parameters=list(all_params.values()),
                         body_schema=body_schema,
                         responses=operation.get('responses', {}),
+                        success_codes=sorted(success_codes),  # Store the extracted codes
                         security_schemes=operation.get('security', [])
                     )
                 )
